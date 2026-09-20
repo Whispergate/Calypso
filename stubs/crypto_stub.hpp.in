@@ -8,7 +8,7 @@
 #include "obfuscate.hpp.in"
 
 {{#IF CRYPTO_CNG}}
-// Windows CNG (BCrypt) decryption — dynamically resolved to avoid import table exposure
+// Windows CNG (BCrypt) decryption - dynamically resolved to avoid import table exposure
 #include <bcrypt.h>
 
 using BCryptOpenAlgorithmProvider_t = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE*, LPCWSTR, LPCWSTR, ULONG);
@@ -260,7 +260,7 @@ static void decrypt_xor(uint8_t* data, size_t data_len,
         data[i] ^= key[i % key_len];
 }
 
-// RC4 stream cipher (symmetric — same operation for encrypt and decrypt)
+// RC4 stream cipher (symmetric - same operation for encrypt and decrypt)
 static void decrypt_rc4(uint8_t* data, size_t data_len,
                          const uint8_t* key, size_t key_len) {
     uint8_t S[256];

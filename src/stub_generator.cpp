@@ -338,7 +338,7 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
         loader_src = replace_all(loader_src, "{{ENCODED_PAYLOAD}}", escaped);
     }
 
-    // DLL exports — each export triggers payload execution
+    // DLL exports - each export triggers payload execution
     if (cfg.output_format == OutputFormat::DLL) {
         std::string exports;
         auto dll_exps = cfg.dll_exports.empty()

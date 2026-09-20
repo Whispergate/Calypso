@@ -123,7 +123,7 @@ static bool hellsgate_resolve(HMODULE ntdll) {
 {{#IF SYSCALL_INDIRECT}}
 // Indirect syscalls: resolve SSNs from in-memory ntdll (Hell's Gate pattern),
 // find a clean syscall;ret gadget for indirect execution.
-// No second ntdll load — avoids "NTDLL loaded for a second time" detection.
+// No second ntdll load - avoids "NTDLL loaded for a second time" detection.
 static void* g_syscall_gadget = nullptr;
 
 static bool indirect_resolve() {
@@ -293,7 +293,7 @@ using NtClose_t                 = NTSTATUS(NTAPI*)(HANDLE);
 // Indirect syscall: call through the clean ntdll stub address.
 // For unhooked stubs we jump to the full preamble (mov r10,rcx; mov eax,SSN;
 // syscall; ret). For hooked stubs where we resolved SSN via neighbors,
-// stub_addr points to a clean neighbor — still valid.
+// stub_addr points to a clean neighbor - still valid.
 template<typename FnType>
 static FnType get_syscall_fn(uint32_t hash) {
     void* addr = get_stub_addr(hash);

@@ -1,5 +1,5 @@
-# Calypso — C++23 Syscall Packer
-# Build the packer tool (not the loader — the loader is generated at pack time)
+# Calypso - C++23 Syscall Packer
+# Build the packer tool (not the loader - the loader is generated at pack time)
 # Cross-platform: works on Windows (MSVC/MinGW) and Linux (g++/clang++)
 
 UNAME_S := $(shell uname -s 2>/dev/null || echo Windows)

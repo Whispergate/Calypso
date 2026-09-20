@@ -20,11 +20,12 @@ Written by **@Whispergate** and **@Lavender-exe**.
 ## Features
 
 - **Payload types** - Shellcode, PE (Run-PE), C# assemblies (CLR hosting), PE-to-shellcode via Donut
-- **Encryption** - AES-256-ECB, AES-256-CBC, XOR with two backends (Windows CNG or vendored tiny-AES-c)
+- **Encryption** - AES-256-ECB, AES-256-CBC, XOR, RC4 with two backends (Windows CNG or vendored tiny-AES-c)
 - **Encoding** - Base64, hex, MAC-address format, UUID format
-- **Compression** - Zlib (miniz) and LZ4
+- **Compression** - Zlib (miniz), LZ4, and RLE (run-length encoding)
 - **Syscall methods** - Hell's Gate, Halo's Gate, Indirect Syscalls
-- **Injection** - Local (direct/thread/APC/callback) and Remote (with PPID spoofing, DLL blocking)
+- **Injection** - Local (direct/thread/APC/callback/fiber) and Remote (with PPID spoofing, DLL blocking)
+- **Memory evasion** - Module stomping (file-backed memory), DripLoader (chunked writes with delays), entropy reduction (XOR masking)
 - **Evasion** - 6 AMSI bypasses, 7 ETW bypasses, anti-debug, sandbox checks, DLL unhooking, self-delete
 - **Obfuscation** - Compile-time string encryption, call trampolines, junk code, opaque predicates, control flow flattening, LLVM IR-level passes (Obfuscator-LLVM)
 - **Output** - EXE or DLL with custom exports
@@ -164,7 +165,7 @@ calypso --file beacon.bin --output loader.exe
 | Flag | Description |
 |------|-------------|
 | `--key <key>` | Encryption key (random 32-char if omitted) |
-| `--cipher <mode>` | `aes-ecb` (default), `aes-cbc`, `xor` |
+| `--cipher <mode>` | `aes-ecb` (default), `aes-cbc`, `xor`, `rc4` |
 | `--crypto-backend <be>` | `cng` (default, Windows BCrypt), `tiny-aes` (vendored, portable) |
 
 ### Encoding & Compression
@@ -172,7 +173,7 @@ calypso --file beacon.bin --output loader.exe
 | Flag | Description |
 |------|-------------|
 | `--encode <method>` | `none` (default), `base64`, `hex`, `mac`, `uuid` |
-| `--compress <method>` | `none` (default), `zlib`, `lz4` |
+| `--compress <method>` | `none` (default), `zlib`, `lz4`, `rle` |
 
 ### Obfuscation
 
@@ -187,10 +188,13 @@ calypso --file beacon.bin --output loader.exe
 | Flag | Description |
 |------|-------------|
 | `--inject <method>` | `local` (default), `remote` |
-| `--execute <prim>` | `direct` (default), `thread`, `apc`, `callback` |
+| `--execute <prim>` | `direct` (default), `thread`, `apc`, `callback`, `fiber` |
 | `--process <name>` | Target process for remote injection (default: `RuntimeBroker.exe`) |
 | `--ppid <name>` | Parent process for PPID spoofing |
 | `--block-dlls` | Block non-Microsoft DLLs in spawned process |
+| `--module-stomp` | Overwrite a sacrificial DLL's .text section instead of allocating new memory |
+| `--drip` | Write shellcode in small 4KB chunks with variable delays |
+| `--entropy-reduce` | XOR payload with English-frequency mask to lower .data section entropy |
 
 ### Syscalls
 
@@ -243,7 +247,7 @@ Payload ──► Compress ──► Encrypt ──► Generate Loader Source �
 |--------|-------------|
 | **Hell's Gate** | Scans ntdll export table for `mov r10,rcx; mov eax,SSN` opcode pattern to extract syscall numbers at runtime |
 | **Halo's Gate** | Extends Hell's Gate: when a stub is hooked (JMP/FF), searches neighboring syscall stubs (+-1,2,...) and computes SSN by offset |
-| **Indirect** | Maps a fresh copy of ntdll.dll from disk, finds the `syscall` instruction address, and jumps through it |
+| **Indirect** | Walks in-memory ntdll from PEB, resolves SSNs via Hell's/Halo's Gate, finds a clean `syscall; ret` gadget in .text, and jumps through it (no second ntdll load) |
 
 ### AMSI Bypass Methods
 
@@ -267,6 +271,15 @@ Payload ──► Compress ──► Encrypt ──► Generate Loader Source �
 | `patch-etwwrite` | Patch `EtwEventWrite` to `ret` |
 | `patch-nttrace` | Patch `NtTraceEvent` to `ret` |
 | `callback-remove` | Remove ETW notification callbacks |
+
+### Memory Evasion Techniques
+
+| Method | Technique |
+|--------|-----------|
+| `--module-stomp` | Load a sacrificial DLL (amsi.dll/dbghelp.dll), overwrite its .text section with shellcode - memory appears file-backed to scanners (evades Moneta, PE-Sieve unbacked detection) |
+| `--drip` | DripLoader: write shellcode in 4KB chunks with variable NtDelayExecution delays between writes - evades real-time memory scanning during injection |
+| `--execute fiber` | CaroKann: ConvertThreadToFiber → CreateFiber → SwitchToFiber execution - avoids CreateThread/NtCreateThreadEx-based detection |
+| `--entropy-reduce` | XOR payload with English-frequency byte mask before embedding - reduces .data section entropy from ~7.9 to ~5.5, evading static entropy analysis |
 
 ### Obfuscation Layers
 
