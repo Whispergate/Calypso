@@ -1,0 +1,3 @@
+[submodule "tools/donut_ollvm"]
+	path = tools/donut_ollvm
+	url = git@github.com:Whispergate/donut_ollvm.git

