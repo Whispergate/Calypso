@@ -84,6 +84,29 @@ static bool decompress_lz4(const uint8_t* src, size_t src_len,
 }
 {{#ENDIF}}
 
+{{#IF COMPRESS_RLE}}
+static bool decompress_rle(const uint8_t* src, size_t src_len,
+                           uint8_t* dst, size_t dst_cap, size_t* dst_len) {
+    size_t si = 0, di = 0;
+    while (si < src_len) {
+        if (src[si] == 0xFF) {
+            if (si + 2 >= src_len) return false;
+            uint8_t count = src[si + 1];
+            uint8_t val   = src[si + 2];
+            if (di + count > dst_cap) return false;
+            for (uint8_t r = 0; r < count; r++)
+                dst[di++] = val;
+            si += 3;
+        } else {
+            if (di >= dst_cap) return false;
+            dst[di++] = src[si++];
+        }
+    }
+    *dst_len = di;
+    return true;
+}
+{{#ENDIF}}
+
 {{#IF ENCODE_BASE64}}
 static const uint8_t b64_decode_table[256] = {
     64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,

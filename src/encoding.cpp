@@ -2,6 +2,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdio>
+#include <random>
 
 namespace calypso {
 
@@ -80,6 +81,24 @@ std::string encode_payload(const std::vector<uint8_t>& data, EncodingMethod meth
         case EncodingMethod::None:   return {};
     }
     return {};
+}
+
+std::vector<uint8_t> generate_entropy_mask(size_t length, uint32_t seed) {
+    static const char english_chars[] =
+        "etaoinshrdlcumwfgypbvkjxqz"
+        "ETAOINSHRDLCUMWFGYPBVKJXQZ"
+        "          "
+        "0123456789"
+        ".,;:!?-'\"()";
+    constexpr size_t charset_len = sizeof(english_chars) - 1;
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<size_t> dist(0, charset_len - 1);
+
+    std::vector<uint8_t> mask(length);
+    for (size_t i = 0; i < length; i++)
+        mask[i] = static_cast<uint8_t>(english_chars[dist(rng)]);
+    return mask;
 }
 
 std::string format_as_cpp_array(const std::vector<uint8_t>& data, const std::string& name) {

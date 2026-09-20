@@ -28,6 +28,7 @@ static const char* cipher_str(calypso::CipherMode c) {
         case calypso::CipherMode::AES_ECB: return "AES-256-ECB";
         case calypso::CipherMode::AES_CBC: return "AES-256-CBC";
         case calypso::CipherMode::XOR:     return "XOR";
+        case calypso::CipherMode::RC4:     return "RC4";
     }
     return "Unknown";
 }
@@ -180,6 +181,23 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "\n";
     }
+    {
+        const char* exec_str = "Direct";
+        switch (cfg.exec_prim) {
+            case calypso::ExecutionPrimitive::Thread:   exec_str = "Thread"; break;
+            case calypso::ExecutionPrimitive::APC:      exec_str = "APC"; break;
+            case calypso::ExecutionPrimitive::Callback: exec_str = "Callback"; break;
+            case calypso::ExecutionPrimitive::Fiber:    exec_str = "Fiber (CaroKann)"; break;
+            default: break;
+        }
+        std::cout << "  Execution:   " << exec_str << "\n";
+    }
+    if (cfg.module_stomp)
+        std::cout << "  Allocation:  Module Stomping\n";
+    if (cfg.drip_load)
+        std::cout << "  Writing:     DripLoader (4KB chunks)\n";
+    if (cfg.entropy_reduce)
+        std::cout << "  Entropy:     Reduced\n";
     if (cfg.obfuscate)
         std::cout << "  Obfuscation: Source-level + string encryption\n";
     if (cfg.llvm_obfuscate)

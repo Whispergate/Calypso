@@ -16,14 +16,29 @@ static bool command_exists(const std::string& cmd) {
     return std::system(check.c_str()) == 0;
 }
 
+static bool is_ollvm(const std::string& clang_path) {
+#ifdef _WIN32
+    std::string check = clang_path + " -mllvm -fla --version >nul 2>nul";
+#else
+    std::string check = clang_path + " -mllvm -fla --version >/dev/null 2>&1";
+#endif
+    return std::system(check.c_str()) == 0;
+}
+
 DetectedCompiler detect_compiler(bool prefer_llvm) {
     if (prefer_llvm) {
-        // Check for Obfuscator-LLVM clang++
         for (const auto& name : {"ollvm-clang++", "clang++-ollvm", "clang++"}) {
-            if (command_exists(name))
+            if (command_exists(name)) {
+                if (is_ollvm(name)) {
+                    return {CompilerType::LLVM, name};
+                }
+                std::cerr << "[!] Found " << name << " but it does not support "
+                          << "Obfuscator-LLVM passes (-fla/-sub/-bcf).\n"
+                          << "[!] Compiling with standard clang++ (no IR obfuscation).\n";
                 return {CompilerType::LLVM, name};
+            }
         }
-        std::cerr << "[!] --llvm-obfuscate requires Obfuscator-LLVM clang++ in PATH\n";
+        std::cerr << "[!] --llvm-obfuscate requires clang++ in PATH\n";
     }
 
 #ifdef _WIN32
@@ -114,8 +129,7 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
         case CompilerType::LLVM: {
             cmd = compiler.path + " -std=c++23 -O2 -w -DNOMINMAX";
 
-            // LLVM obfuscation passes
-            if (cfg.llvm_obfuscate) {
+            if (cfg.llvm_obfuscate && is_ollvm(compiler.path)) {
                 cmd += " -mllvm -fla -mllvm -sub -mllvm -bcf -mllvm -bcf_prob=40";
                 cmd += " -mllvm -split";
             }

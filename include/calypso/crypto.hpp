@@ -14,6 +14,8 @@ std::vector<uint8_t> encrypt_aes_cbc(const std::vector<uint8_t>& data,
                                       const std::vector<uint8_t>& key);
 std::vector<uint8_t> encrypt_xor(const std::vector<uint8_t>& data,
                                   const std::vector<uint8_t>& key);
+std::vector<uint8_t> encrypt_rc4(const std::vector<uint8_t>& data,
+                                  const std::vector<uint8_t>& key);
 
 std::vector<uint8_t> encrypt_payload(const std::vector<uint8_t>& data,
                                       const std::string& key,

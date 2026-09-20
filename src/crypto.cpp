@@ -88,6 +88,26 @@ std::vector<uint8_t> encrypt_xor(const std::vector<uint8_t>& data,
     return output;
 }
 
+std::vector<uint8_t> encrypt_rc4(const std::vector<uint8_t>& data,
+                                  const std::vector<uint8_t>& key) {
+    uint8_t S[256];
+    for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
+    uint8_t j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = j + S[i] + key[i % key.size()];
+        std::swap(S[i], S[j]);
+    }
+    std::vector<uint8_t> output(data.size());
+    uint8_t ii = 0, jj = 0;
+    for (size_t k = 0; k < data.size(); k++) {
+        ii++;
+        jj += S[ii];
+        std::swap(S[ii], S[jj]);
+        output[k] = data[k] ^ S[static_cast<uint8_t>(S[ii] + S[jj])];
+    }
+    return output;
+}
+
 std::vector<uint8_t> encrypt_payload(const std::vector<uint8_t>& data,
                                       const std::string& key,
                                       CipherMode cipher) {
@@ -97,6 +117,7 @@ std::vector<uint8_t> encrypt_payload(const std::vector<uint8_t>& data,
         case CipherMode::AES_ECB: return encrypt_aes_ecb(data, expanded);
         case CipherMode::AES_CBC: return encrypt_aes_cbc(data, expanded);
         case CipherMode::XOR:     return encrypt_xor(data, expanded);
+        case CipherMode::RC4:     return encrypt_rc4(data, expanded);
     }
     return {};
 }

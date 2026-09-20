@@ -8,12 +8,12 @@
 namespace calypso {
 
 enum class PayloadType { Auto, Shellcode, PE, CSharp };
-enum class CipherMode { AES_ECB, AES_CBC, XOR };
+enum class CipherMode { AES_ECB, AES_CBC, XOR, RC4 };
 enum class CryptoBackend { CNG, TinyAES };
 enum class EncodingMethod { None, Base64, Hex, MAC, UUID };
-enum class CompressionMethod { None, Zlib, LZ4 };
+enum class CompressionMethod { None, Zlib, LZ4, RLE };
 enum class InjectionMethod { Local, Remote };
-enum class ExecutionPrimitive { Direct, Thread, APC, Callback };
+enum class ExecutionPrimitive { Direct, Thread, APC, Callback, Fiber };
 enum class SyscallMethod { Indirect, HellsGate, HalosGate };
 enum class OutputFormat { EXE, DLL };
 
@@ -98,6 +98,8 @@ struct PackerConfig {
     std::string target_process     = "RuntimeBroker.exe";
     std::string ppid_process;
     bool block_dlls                = false;
+    bool module_stomp              = false;
+    bool drip_load                 = false;
 
     // Syscalls
     SyscallMethod syscall_method   = SyscallMethod::Indirect;
@@ -118,6 +120,7 @@ struct PackerConfig {
     bool hide_window               = false;
     bool source_only               = false;
     bool verbose                   = false;
+    bool entropy_reduce            = false;
 };
 
 } // namespace calypso

