@@ -86,9 +86,11 @@ int main(int argc, char* argv[]) {
     if (cfg.compression != calypso::CompressionMethod::None) {
         std::cout << "[*] Compressing payload..." << std::endl;
         auto compressed = calypso::compress_payload(payload.data, cfg.compression);
+        int64_t pct = 100 - static_cast<int64_t>(compressed.size()) * 100
+                          / static_cast<int64_t>(payload.data.size());
         std::cout << "[+] Compressed: " << payload.data.size() << " -> "
                   << compressed.size() << " bytes ("
-                  << (100 - (compressed.size() * 100 / payload.data.size())) << "% reduction)\n";
+                  << pct << "% reduction)\n";
         payload.data = std::move(compressed);
     }
 
@@ -122,7 +124,7 @@ int main(int argc, char* argv[]) {
     } else {
 
     // Step 6: Detect compiler
-    auto compiler = calypso::detect_compiler(cfg.llvm_obfuscate);
+    auto compiler = calypso::detect_compiler(cfg.llvm_obfuscate, cfg.ollvm_plugin);
     if (compiler.type == calypso::CompilerType::None) {
 #ifndef _WIN32
         // On Linux, try cross-compiler

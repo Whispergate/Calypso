@@ -90,6 +90,7 @@ struct PackerConfig {
     // Obfuscation
     bool obfuscate                 = false;
     bool llvm_obfuscate            = false;
+    std::string ollvm_plugin;
     uint32_t obf_seed              = 0;
 
     // Injection

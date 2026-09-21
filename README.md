@@ -13,8 +13,6 @@ A C++23 syscall packer for authorized security testing. Takes PE files, C# assem
 
 Written by **@Whispergate** and **@Lavender-exe**.
 
-> **Disclaimer:** This tool is intended for authorized penetration testing and red team engagements only. Unauthorized use is illegal.
-
 ---
 
 ## Features
@@ -59,12 +57,51 @@ build.bat
 
 ### Docker
 
+The Docker image includes everything needed: `g++-14`, `mingw-w64`, LLVM 21, and the [eshard/obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) plugin pre-built. No host dependencies required.
+
 ```bash
 docker build -t calypso .
-docker run --rm -v $(pwd)/payloads:/payloads calypso --file /payloads/beacon.bin
 ```
 
-The Docker image (Ubuntu 24.04) includes `g++-14` and `mingw-w64` for cross-compiling Windows loaders.
+Mount your payloads directory and an output directory, then run as if calypso were installed locally:
+
+```bash
+docker run --rm \
+    -v $(pwd)/payloads:/payloads \
+    -v $(pwd)/output:/output \
+    calypso --file /payloads/beacon.bin --output /output/loader.exe
+```
+
+With OLLVM obfuscation (the plugin is pre-installed in the image):
+
+```bash
+docker run --rm \
+    -v $(pwd)/payloads:/payloads \
+    -v $(pwd)/output:/output \
+    calypso --file /payloads/beacon.bin --llvm-obfuscate --output /output/loader.exe
+```
+
+Full evasion example:
+
+```bash
+docker run --rm \
+    -v $(pwd)/payloads:/payloads \
+    -v $(pwd)/output:/output \
+    calypso --file /payloads/beacon.bin \
+        --cipher rc4 --compress rle --encode uuid \
+        --execute fiber --module-stomp --drip --entropy-reduce \
+        --amsi context-corrupt --etw complus \
+        --sandbox domain,memory,diskspace \
+        --self-delete --hide --llvm-obfuscate \
+        --output /output/loader.exe
+```
+
+You can also create a shell alias for convenience:
+
+```bash
+alias calypso='docker run --rm -v $(pwd):/work -w /work calypso'
+calypso --file beacon.bin --output loader.exe
+```
 
 ### Building donut_ollvm
 
@@ -180,7 +217,8 @@ calypso --file beacon.bin --output loader.exe
 | Flag | Description |
 |------|-------------|
 | `--obfuscate` | Source-level: string encryption, junk code, opaque predicates, control flow flattening |
-| `--llvm-obfuscate` | IR-level: requires Obfuscator-LLVM (`clang++`) in PATH |
+| `--llvm-obfuscate` | IR-level: requires [eshard/obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) plugin (see [Installing Obfuscator-LLVM](#installing-obfuscator-llvm)) |
+| `--ollvm-plugin <path>` | Path to `libLLVMObfuscator.so` (default: `/opt/llvm/libLLVMObfuscator.so`) |
 | `--obf-seed <seed>` | Custom seed for reproducible obfuscation |
 
 ### Injection
@@ -286,46 +324,58 @@ Payload ──► Compress ──► Encrypt ──► Generate Loader Source �
 1. **Compile-time string encryption** - `obf("string")` macro using constexpr XOR with `__COUNTER__`-derived keys (inspired by ADVobfuscator)
 2. **Compile-time call obfuscation** - Indirect function calls via volatile trampoline templates
 3. **Source-level** - Junk code insertion, opaque predicates, control flow flattening (inspired by Obfusk8)
-4. **LLVM IR-level** - Control flow flattening, instruction substitution, bogus control flow via Obfuscator-LLVM passes
+4. **LLVM IR-level** - Control flow flattening, instruction substitution, bogus control flow, basic block splitting, string obfuscation via [eshard/obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) pass plugin
 
 ---
 
-## Project Structure
+## Installing Obfuscator-LLVM
 
+Calypso uses [eshard/obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) as an LLVM new pass manager plugin. It works with standard LLVM 17+ (tested with LLVM 21).
+
+### Prerequisites
+
+```bash
+sudo apt install llvm-21 llvm-21-dev clang-21 ninja-build cmake
 ```
-Calypso/
-├── Makefile                     # Cross-platform build (Linux/Mac/Windows)
-├── build.bat                    # Windows MSVC/MinGW convenience script
-├── Dockerfile                   # Ubuntu 24.04 + mingw-w64
-├── include/calypso/             # Packer headers
-│   ├── config.hpp               # PackerConfig struct, all enums
-│   ├── cli.hpp                  # CLI parsing
-│   ├── crypto.hpp               # AES/XOR encryption
-│   ├── encoding.hpp             # Base64/hex/MAC/UUID encoding
-│   ├── compression.hpp          # Zlib/LZ4 compression
-│   ├── obfuscation.hpp          # Source-level obfuscation generators
-│   ├── payload.hpp              # Payload reading & detection
-│   ├── pe_parser.hpp            # PE header parsing
-│   ├── stub_generator.hpp       # Template engine
-│   └── compiler.hpp             # Compiler detection & invocation
-├── src/                         # Packer implementation
-├── stubs/                       # Loader templates (.cpp.in / .hpp.in)
-│   ├── loader_shellcode.cpp.in  # Shellcode injection loader
-│   ├── loader_pe.cpp.in         # Run-PE loader
-│   ├── loader_csharp.cpp.in     # CLR hosting loader
-│   ├── syscalls.hpp.in          # Hell's/Halo's Gate, indirect syscalls
-│   ├── evasion.hpp.in           # AMSI/ETW bypass, anti-debug, sandbox
-│   ├── obfuscate.hpp.in         # Compile-time string/call encryption
-│   ├── crypto_stub.hpp.in       # Decryption (CNG or tiny-AES)
-│   └── common.hpp.in            # Decompression, decoding, utilities
-├── third_party/                 # Vendored dependencies
-│   ├── tiny-aes/                # AES-256 (kokke/tiny-AES-c, public domain)
-│   ├── miniz/                   # Zlib-compatible (richgel999/miniz, MIT)
-│   └── lz4/                     # LZ4 compression (Yann Collet, BSD 2-Clause)
-└── tools/
-    ├── donut                    # PE-to-shellcode converter (built from donut_ollvm)
-    └── donut_ollvm/             # Donut fork with OLLVM obfuscation support
+
+### Building the Plugin
+
+```bash
+cd /opt
+sudo git clone https://github.com/eshard/obfuscator-llvm
+cd obfuscator-llvm
+mkdir build && cd build
+cmake -G "Ninja" -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm ..
+ninja -j$(nproc)
 ```
+
+The built plugin is at `/opt/obfuscator-llvm/build/libLLVMObfuscator.so`. Copy it to the default search path:
+
+```bash
+sudo cp /opt/obfuscator-llvm/build/libLLVMObfuscator.so /opt/llvm/libLLVMObfuscator.so
+```
+
+### Usage
+
+```bash
+calypso --file beacon.bin --llvm-obfuscate
+```
+
+Calypso searches for `libLLVMObfuscator.so` in `/opt/llvm/`, `/usr/lib/`, and `/usr/local/lib/`. To use a custom path:
+
+```bash
+calypso --file beacon.bin --llvm-obfuscate --ollvm-plugin /path/to/libLLVMObfuscator.so
+```
+
+When `--llvm-obfuscate` is active, `clang++` cross-compiles the loader with `--target=x86_64-w64-mingw32` and the following OLLVM passes are applied:
+
+| Pass | Effect |
+|------|--------|
+| **Flattening** | Transforms function control flow into flat switch dispatchers |
+| **Substitution** | Replaces standard operations with equivalent complex sequences |
+| **Bogus Control Flow** | Inserts fake basic blocks with opaque predicates |
+| **Split Basic Blocks** | Splits blocks to increase CFG complexity |
+| **String Encryption** | Encrypts string literals, decrypted at runtime |
 
 ---
 
@@ -336,7 +386,7 @@ Calypso/
 | [NimSyscallPacker](https://github.com/ShitSecure/NimSyscallPacker) | @ShitSecure (Fabian Mosch) | Primary reference architecture, syscall techniques, evasion, injection |
 | [Obfusk8](https://github.com/x86byte/Obfusk8) | @x86byte | Compile-time C++ obfuscation patterns |
 | [ADVobfuscator](https://github.com/andrivet/advobfuscator) | Sebastien Andrivet | Compile-time metaprogramming, `__COUNTER__`-based key generation |
-| [Obfuscator-LLVM](https://github.com/obfuscator-llvm/obfuscator) | - | LLVM IR-level obfuscation passes (FLA, SUB, BCF) |
+| [obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) | eshard | LLVM new pass manager plugin - flattening, substitution, bogus control flow, split basic blocks, string encryption |
 | [Donut](https://github.com/TheWover/donut) | @TheWover, Odzhan | PE-to-shellcode conversion |
 | [Hell's Gate](https://github.com/am0nsec/HellsGate) | @am0nsec, @smelly__vx | Runtime syscall number resolution via opcode matching |
 | [Halo's Gate](https://blog.sektor7.net/) | @sektor7 | Neighbor-search for hooked syscall stubs |

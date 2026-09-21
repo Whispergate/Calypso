@@ -43,6 +43,7 @@ Compression:
 Obfuscation:
   --obfuscate             Enable source-level obfuscation
   --llvm-obfuscate        Use Obfuscator-LLVM for IR-level obfuscation
+  --ollvm-plugin <path>   Path to libLLVMObfuscator.so (default: /opt/llvm/libLLVMObfuscator.so)
   --obf-seed <seed>       Custom seed for obfuscation randomness
 
 Injection:
@@ -207,6 +208,8 @@ PackerConfig parse_args(int argc, char* argv[]) {
             cfg.obfuscate = true;
         } else if (arg == "--llvm-obfuscate") {
             cfg.llvm_obfuscate = true;
+        } else if (arg == "--ollvm-plugin") {
+            cfg.ollvm_plugin = get_next(i);
         } else if (arg == "--obf-seed") {
             cfg.obf_seed = static_cast<uint32_t>(std::stoul(get_next(i)));
         } else if (arg == "--inject") {
