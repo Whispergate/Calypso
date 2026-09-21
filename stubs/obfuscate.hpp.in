@@ -79,7 +79,7 @@ struct ObfWString {
 
 #define obf(s) []() -> const char* { \
     constexpr auto key = OBF_KEY(__COUNTER__, __LINE__); \
-    static constexpr volatile calypso_obf::ObfString<sizeof(s), key> enc(s); \
+    static const volatile calypso_obf::ObfString<sizeof(s), key> enc(s); \
     static char buf[sizeof(s)]; \
     enc.get(buf, sizeof(buf)); \
     return buf; \
@@ -87,7 +87,7 @@ struct ObfWString {
 
 #define obf_wide(s) []() -> const wchar_t* { \
     constexpr auto key = OBF_KEY(__COUNTER__, __LINE__); \
-    static constexpr volatile calypso_obf::ObfWString<sizeof(s)/sizeof(wchar_t), key> enc(s); \
+    static const volatile calypso_obf::ObfWString<sizeof(s)/sizeof(wchar_t), key> enc(s); \
     static wchar_t buf[sizeof(s)/sizeof(wchar_t)]; \
     enc.get(buf, sizeof(s)/sizeof(wchar_t)); \
     return buf; \

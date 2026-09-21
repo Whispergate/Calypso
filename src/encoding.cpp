@@ -34,40 +34,49 @@ std::string encode_hex(const std::vector<uint8_t>& data) {
 }
 
 std::string encode_mac(const std::vector<uint8_t>& data) {
-    // Pad to multiple of 6 bytes
-    std::vector<uint8_t> padded = data;
-    while (padded.size() % 6 != 0)
-        padded.push_back(0);
-
     std::string out;
-    for (size_t i = 0; i < padded.size(); i += 6) {
+    for (size_t i = 0; i < data.size(); i += 6) {
         if (!out.empty()) out += "\n";
-        char buf[18];
-        std::snprintf(buf, sizeof(buf), "%02X-%02X-%02X-%02X-%02X-%02X",
-                      padded[i], padded[i+1], padded[i+2],
-                      padded[i+3], padded[i+4], padded[i+5]);
-        out += buf;
+        size_t remaining = data.size() - i;
+        if (remaining >= 6) {
+            char buf[18];
+            std::snprintf(buf, sizeof(buf), "%02X-%02X-%02X-%02X-%02X-%02X",
+                          data[i], data[i+1], data[i+2],
+                          data[i+3], data[i+4], data[i+5]);
+            out += buf;
+        } else {
+            for (size_t j = 0; j < remaining; j++) {
+                if (j > 0) out += "-";
+                char buf[4];
+                std::snprintf(buf, sizeof(buf), "%02X", data[i+j]);
+                out += buf;
+            }
+        }
     }
     return out;
 }
 
 std::string encode_uuid(const std::vector<uint8_t>& data) {
-    // Pad to multiple of 16 bytes
-    std::vector<uint8_t> padded = data;
-    while (padded.size() % 16 != 0)
-        padded.push_back(0);
-
     std::string out;
-    for (size_t i = 0; i < padded.size(); i += 16) {
+    for (size_t i = 0; i < data.size(); i += 16) {
         if (!out.empty()) out += "\n";
-        char buf[48];
-        std::snprintf(buf, sizeof(buf),
-            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-            padded[i], padded[i+1], padded[i+2], padded[i+3],
-            padded[i+4], padded[i+5], padded[i+6], padded[i+7],
-            padded[i+8], padded[i+9], padded[i+10], padded[i+11],
-            padded[i+12], padded[i+13], padded[i+14], padded[i+15]);
-        out += buf;
+        size_t remaining = data.size() - i;
+        if (remaining >= 16) {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                data[i], data[i+1], data[i+2], data[i+3],
+                data[i+4], data[i+5], data[i+6], data[i+7],
+                data[i+8], data[i+9], data[i+10], data[i+11],
+                data[i+12], data[i+13], data[i+14], data[i+15]);
+            out += buf;
+        } else {
+            for (size_t j = 0; j < remaining; j++) {
+                char buf[4];
+                std::snprintf(buf, sizeof(buf), "%02x", data[i+j]);
+                out += buf;
+            }
+        }
     }
     return out;
 }

