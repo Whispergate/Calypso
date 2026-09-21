@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     cmake \
     ninja-build \
     git \
+    xxd \
     lsb-release \
     wget \
     software-properties-common \
