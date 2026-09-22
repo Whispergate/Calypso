@@ -7,32 +7,166 @@
 #include "obfuscate.hpp.in"
 
 {{#IF COMPRESS_ZLIB}}
-// Minimal zlib decompression (stored blocks only - matches packer's miniz output)
 static bool decompress_zlib(const uint8_t* src, size_t src_len,
                             uint8_t* dst, size_t dst_cap, size_t* dst_len) {
     if (src_len < 6) return false;
-    const uint8_t* p = src + 2; // skip zlib header
-    size_t remaining = src_len - 6;
-    uint8_t* out = dst;
-    size_t out_left = dst_cap;
 
-    while (remaining > 0) {
-        uint8_t hdr = *p++; remaining--;
-        int btype = (hdr >> 1) & 3;
+    struct BitReader {
+        const uint8_t* p;
+        size_t left;
+        uint32_t buf;
+        int bits;
+        void init(const uint8_t* s, size_t l) { p = s; left = l; buf = 0; bits = 0; }
+        bool ensure(int n) {
+            while (bits < n) {
+                if (left == 0) return false;
+                buf |= (uint32_t)(*p++) << bits;
+                left--; bits += 8;
+            }
+            return true;
+        }
+        uint32_t peek(int n) { return buf & ((1u << n) - 1); }
+        void drop(int n) { buf >>= n; bits -= n; }
+        uint32_t read(int n) { ensure(n); uint32_t v = peek(n); drop(n); return v; }
+        void align() { int r = bits & 7; if (r) { drop(r); } }
+    };
+
+    static const uint16_t len_base[] = {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
+        35,43,51,59,67,83,99,115,131,163,195,227,258
+    };
+    static const uint8_t len_extra[] = {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,
+        3,3,3,3,4,4,4,4,5,5,5,5,0
+    };
+    static const uint16_t dist_base[] = {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,
+        257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577
+    };
+    static const uint8_t dist_extra[] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,
+        7,7,8,8,9,9,10,10,11,11,12,12,13,13
+    };
+    static const uint8_t cl_order[] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+
+    struct HTree {
+        uint16_t counts[16];
+        uint16_t symbols[320];
+        int max_bits;
+        void build(const uint8_t* lengths, int n) {
+            memset(counts, 0, sizeof(counts));
+            max_bits = 0;
+            for (int i = 0; i < n; i++) {
+                if (lengths[i]) { counts[lengths[i]]++; if (lengths[i] > max_bits) max_bits = lengths[i]; }
+            }
+            uint16_t offsets[16]; offsets[0] = 0;
+            for (int i = 1; i <= max_bits; i++) offsets[i] = offsets[i-1] + counts[i-1];
+            for (int i = 0; i < n; i++)
+                if (lengths[i]) symbols[offsets[lengths[i]]++] = (uint16_t)i;
+        }
+        int decode(BitReader& br) {
+            int code = 0, first = 0, idx = 0;
+            for (int b = 1; b <= max_bits; b++) {
+                if (!br.ensure(b)) return -1;
+                code = (code << 1) | ((br.buf >> (b - 1)) & 1);
+                int count = counts[b];
+                if (code - first < count) {
+                    br.drop(b);
+                    return symbols[idx + code - first];
+                }
+                idx += count;
+                first = (first + count) << 1;
+            }
+            return -1;
+        }
+    };
+
+    BitReader br;
+    br.init(src + 2, src_len - 6);
+    uint8_t* out = dst;
+    size_t out_pos = 0;
+
+    for (;;) {
+        uint32_t bfinal = br.read(1);
+        uint32_t btype = br.read(2);
+
         if (btype == 0) {
-            if (remaining < 4) return false;
-            uint16_t len = p[0] | ((uint16_t)p[1] << 8);
-            p += 4; remaining -= 4;
-            if (remaining < len || out_left < len) return false;
-            memcpy(out, p, len);
-            p += len; remaining -= len;
-            out += len; out_left -= len;
+            br.align();
+            if (!br.ensure(32)) return false;
+            uint16_t len = (uint16_t)br.read(16);
+            br.read(16);
+            for (uint16_t i = 0; i < len; i++) {
+                if (out_pos >= dst_cap || !br.ensure(8)) return false;
+                out[out_pos++] = (uint8_t)br.read(8);
+            }
+        } else if (btype == 1 || btype == 2) {
+            HTree lit_tree, dist_tree;
+
+            if (btype == 1) {
+                uint8_t ll[288], dl[32];
+                for (int i = 0; i <= 143; i++) ll[i] = 8;
+                for (int i = 144; i <= 255; i++) ll[i] = 9;
+                for (int i = 256; i <= 279; i++) ll[i] = 7;
+                for (int i = 280; i <= 287; i++) ll[i] = 8;
+                for (int i = 0; i < 32; i++) dl[i] = 5;
+                lit_tree.build(ll, 288);
+                dist_tree.build(dl, 32);
+            } else {
+                int hlit = br.read(5) + 257;
+                int hdist = br.read(5) + 1;
+                int hclen = br.read(4) + 4;
+                uint8_t cl_lens[19] = {};
+                for (int i = 0; i < hclen; i++) cl_lens[cl_order[i]] = (uint8_t)br.read(3);
+                HTree cl_tree;
+                cl_tree.build(cl_lens, 19);
+                uint8_t lens[288 + 32] = {};
+                int total = hlit + hdist;
+                for (int i = 0; i < total;) {
+                    int sym = cl_tree.decode(br);
+                    if (sym < 0) return false;
+                    if (sym < 16) { lens[i++] = (uint8_t)sym; }
+                    else if (sym == 16) {
+                        int rep = br.read(2) + 3;
+                        uint8_t v = i > 0 ? lens[i-1] : 0;
+                        for (int r = 0; r < rep && i < total; r++) lens[i++] = v;
+                    } else if (sym == 17) {
+                        int rep = br.read(3) + 3;
+                        for (int r = 0; r < rep && i < total; r++) lens[i++] = 0;
+                    } else {
+                        int rep = br.read(7) + 11;
+                        for (int r = 0; r < rep && i < total; r++) lens[i++] = 0;
+                    }
+                }
+                lit_tree.build(lens, hlit);
+                dist_tree.build(lens + hlit, hdist);
+            }
+
+            for (;;) {
+                int sym = lit_tree.decode(br);
+                if (sym < 0) return false;
+                if (sym < 256) {
+                    if (out_pos >= dst_cap) return false;
+                    out[out_pos++] = (uint8_t)sym;
+                } else if (sym == 256) {
+                    break;
+                } else {
+                    int li = sym - 257;
+                    uint32_t length = len_base[li] + br.read(len_extra[li]);
+                    int ds = dist_tree.decode(br);
+                    if (ds < 0) return false;
+                    uint32_t dist = dist_base[ds] + br.read(dist_extra[ds]);
+                    if (dist > out_pos || out_pos + length > dst_cap) return false;
+                    for (uint32_t i = 0; i < length; i++)
+                        out[out_pos + i] = out[out_pos - dist + i];
+                    out_pos += length;
+                }
+            }
         } else {
             return false;
         }
-        if (hdr & 1) break;
+        if (bfinal) break;
     }
-    *dst_len = (size_t)(out - dst);
+    *dst_len = out_pos;
     return true;
 }
 {{#ENDIF}}
@@ -80,6 +214,25 @@ static bool decompress_lz4(const uint8_t* src, size_t src_len,
         op += match_len;
     }
     *dst_len = (size_t)(op - dst);
+    return true;
+}
+{{#ENDIF}}
+
+{{#IF COMPRESS_LZNT}}
+static bool decompress_lznt(const uint8_t* src, size_t src_len,
+                            uint8_t* dst, size_t dst_cap, size_t* dst_len) {
+    using RtlDecompressBuffer_t = LONG(NTAPI*)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return false;
+    auto pRDB = reinterpret_cast<RtlDecompressBuffer_t>(
+        GetProcAddress(hNtdll, obf("RtlDecompressBuffer")));
+    if (!pRDB) return false;
+    ULONG final_size = 0;
+    LONG status = pRDB(0x0002, dst, static_cast<ULONG>(dst_cap),
+                       const_cast<PUCHAR>(src), static_cast<ULONG>(src_len),
+                       &final_size);
+    if (status != 0) return false;
+    *dst_len = final_size;
     return true;
 }
 {{#ENDIF}}

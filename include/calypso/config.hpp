@@ -11,9 +11,9 @@ enum class PayloadType { Auto, Shellcode, PE, CSharp };
 enum class CipherMode { AES_ECB, AES_CBC, XOR, RC4 };
 enum class CryptoBackend { CNG, TinyAES };
 enum class EncodingMethod { None, Base64, Hex, MAC, UUID };
-enum class CompressionMethod { None, Zlib, LZ4, RLE };
+enum class CompressionMethod { None, Zlib, LZ4, RLE, LZNT };
 enum class InjectionMethod { Local, Remote };
-enum class ExecutionPrimitive { Direct, Thread, APC, Callback, Fiber };
+enum class ExecutionPrimitive { Direct, Thread, APC, Callback, Fiber, VM, RiscVM };
 enum class SyscallMethod { Indirect, HellsGate, HalosGate };
 enum class OutputFormat { EXE, DLL };
 

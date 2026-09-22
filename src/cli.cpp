@@ -38,7 +38,7 @@ Encoding:
   --encode <method>       none (default) | base64 | hex | mac | uuid
 
 Compression:
-  --compress <method>     none (default) | zlib | lz4 | rle
+  --compress <method>     none (default) | zlib | lz4 | rle | lznt
 
 Obfuscation:
   --obfuscate             Enable source-level obfuscation
@@ -48,7 +48,7 @@ Obfuscation:
 
 Injection:
   --inject <method>       local (default) | remote
-  --execute <primitive>   direct (default) | thread | apc | callback | fiber
+  --execute <primitive>   direct (default) | thread | apc | callback | fiber | vm | riscvm
   --process <name>        Target for remote inject (default: RuntimeBroker.exe)
   --ppid <name>           Parent process name for PPID spoofing
   --block-dlls            Block non-Microsoft DLLs in spawned process
@@ -203,6 +203,7 @@ PackerConfig parse_args(int argc, char* argv[]) {
             else if (c == "zlib")     cfg.compression = CompressionMethod::Zlib;
             else if (c == "lz4")      cfg.compression = CompressionMethod::LZ4;
             else if (c == "rle")      cfg.compression = CompressionMethod::RLE;
+            else if (c == "lznt")     cfg.compression = CompressionMethod::LZNT;
             else { std::cerr << "[!] Unknown compression: " << c << "\n"; std::exit(1); }
         } else if (arg == "--obfuscate") {
             cfg.obfuscate = true;
@@ -224,6 +225,8 @@ PackerConfig parse_args(int argc, char* argv[]) {
             else if (p == "apc")      cfg.exec_prim = ExecutionPrimitive::APC;
             else if (p == "callback") cfg.exec_prim = ExecutionPrimitive::Callback;
             else if (p == "fiber")    cfg.exec_prim = ExecutionPrimitive::Fiber;
+            else if (p == "vm")      cfg.exec_prim = ExecutionPrimitive::VM;
+            else if (p == "riscvm")  cfg.exec_prim = ExecutionPrimitive::RiscVM;
             else { std::cerr << "[!] Unknown execute: " << p << "\n"; std::exit(1); }
         } else if (arg == "--process") {
             cfg.target_process = get_next(i);

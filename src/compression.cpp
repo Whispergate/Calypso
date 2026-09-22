@@ -49,6 +49,98 @@ std::vector<uint8_t> compress_lz4(const std::vector<uint8_t>& data) {
     return compressed;
 }
 
+static int lznt_disp_bits(int pos) {
+    if (pos < 0x10)  return 12;
+    if (pos < 0x20)  return 11;
+    if (pos < 0x40)  return 10;
+    if (pos < 0x80)  return 9;
+    if (pos < 0x100) return 8;
+    if (pos < 0x200) return 7;
+    if (pos < 0x400) return 6;
+    if (pos < 0x800) return 5;
+    return 4;
+}
+
+static std::vector<uint8_t> lznt_compress_chunk(const uint8_t* src, size_t len) {
+    std::vector<uint8_t> out;
+    out.reserve(len);
+
+    size_t pos = 0;
+    while (pos < len) {
+        uint8_t flags = 0;
+        size_t flag_pos = out.size();
+        out.push_back(0);
+
+        for (int bit = 0; bit < 8 && pos < len; bit++) {
+            if (pos == 0) {
+                out.push_back(src[pos++]);
+                continue;
+            }
+
+            int db = lznt_disp_bits(static_cast<int>(pos));
+            int max_disp = 1 << db;
+            int lb = 16 - db;
+            int max_len = (1 << lb) + 2;
+
+            int best_len = 0, best_off = 0;
+            int search_start = (pos > static_cast<size_t>(max_disp)) ? static_cast<int>(pos) - max_disp : 0;
+
+            for (int s = search_start; s < static_cast<int>(pos); s++) {
+                int ml = 0;
+                while (pos + ml < len && src[s + ml] == src[pos + ml] && ml < max_len)
+                    ml++;
+                if (ml > best_len) {
+                    best_len = ml;
+                    best_off = static_cast<int>(pos) - s;
+                }
+            }
+
+            if (best_len >= 3) {
+                int disp_val = best_off - 1;
+                int len_val = best_len - 3;
+                uint16_t ref = static_cast<uint16_t>((len_val << db) | disp_val);
+                out.push_back(ref & 0xFF);
+                out.push_back(ref >> 8);
+                flags |= (1 << bit);
+                pos += best_len;
+            } else {
+                out.push_back(src[pos++]);
+            }
+        }
+        out[flag_pos] = flags;
+    }
+    return out;
+}
+
+std::vector<uint8_t> compress_lznt(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> out;
+    size_t offset = 0;
+
+    while (offset < data.size()) {
+        size_t chunk_len = std::min<size_t>(4096, data.size() - offset);
+        const uint8_t* chunk = data.data() + offset;
+
+        auto compressed = lznt_compress_chunk(chunk, chunk_len);
+
+        if (compressed.size() < chunk_len) {
+            uint16_t header = static_cast<uint16_t>(compressed.size() - 1) | 0xB000;
+            out.push_back(header & 0xFF);
+            out.push_back(header >> 8);
+            out.insert(out.end(), compressed.begin(), compressed.end());
+        } else {
+            uint16_t header = static_cast<uint16_t>(chunk_len - 1) | 0x3000;
+            out.push_back(header & 0xFF);
+            out.push_back(header >> 8);
+            out.insert(out.end(), chunk, chunk + chunk_len);
+        }
+        offset += chunk_len;
+    }
+    // End marker
+    out.push_back(0);
+    out.push_back(0);
+    return out;
+}
+
 std::vector<uint8_t> compress_rle(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> out;
     out.reserve(data.size());
@@ -77,6 +169,7 @@ std::vector<uint8_t> compress_payload(const std::vector<uint8_t>& data,
         case CompressionMethod::Zlib: return compress_zlib(data);
         case CompressionMethod::LZ4:  return compress_lz4(data);
         case CompressionMethod::RLE:  return compress_rle(data);
+        case CompressionMethod::LZNT: return compress_lznt(data);
         case CompressionMethod::None: return data;
     }
     return data;

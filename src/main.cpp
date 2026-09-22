@@ -190,6 +190,8 @@ int main(int argc, char* argv[]) {
             case calypso::ExecutionPrimitive::APC:      exec_str = "APC"; break;
             case calypso::ExecutionPrimitive::Callback: exec_str = "Callback"; break;
             case calypso::ExecutionPrimitive::Fiber:    exec_str = "Fiber (CaroKann)"; break;
+            case calypso::ExecutionPrimitive::VM:       exec_str = "VM (IR dispatch)"; break;
+            case calypso::ExecutionPrimitive::RiscVM:   exec_str = "RISC-V VM"; break;
             default: break;
         }
         std::cout << "  Execution:   " << exec_str << "\n";
