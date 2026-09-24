@@ -30,14 +30,14 @@ struct CngFunctions {
 
 static CngFunctions resolve_cng() {
     CngFunctions f = {};
-    HMODULE hBcrypt = LoadLibraryW(obf_wide(L"bcrypt.dll"));
+    HMODULE hBcrypt = load_module(L"bcrypt.dll");
     if (!hBcrypt) return f;
-    f.pOpen     = reinterpret_cast<BCryptOpenAlgorithmProvider_t>(GetProcAddress(hBcrypt, obf("BCryptOpenAlgorithmProvider")));
-    f.pSetProp  = reinterpret_cast<BCryptSetProperty_t>(GetProcAddress(hBcrypt, obf("BCryptSetProperty")));
-    f.pGenKey   = reinterpret_cast<BCryptGenerateSymmetricKey_t>(GetProcAddress(hBcrypt, obf("BCryptGenerateSymmetricKey")));
-    f.pDecrypt  = reinterpret_cast<BCryptDecrypt_t>(GetProcAddress(hBcrypt, obf("BCryptDecrypt")));
-    f.pDestroyKey = reinterpret_cast<BCryptDestroyKey_t>(GetProcAddress(hBcrypt, obf("BCryptDestroyKey")));
-    f.pClose    = reinterpret_cast<BCryptCloseAlgorithmProvider_t>(GetProcAddress(hBcrypt, obf("BCryptCloseAlgorithmProvider")));
+    f.pOpen     = reinterpret_cast<BCryptOpenAlgorithmProvider_t>(resolve_function(hBcrypt, HASHA("BCryptOpenAlgorithmProvider")));
+    f.pSetProp  = reinterpret_cast<BCryptSetProperty_t>(resolve_function(hBcrypt, HASHA("BCryptSetProperty")));
+    f.pGenKey   = reinterpret_cast<BCryptGenerateSymmetricKey_t>(resolve_function(hBcrypt, HASHA("BCryptGenerateSymmetricKey")));
+    f.pDecrypt  = reinterpret_cast<BCryptDecrypt_t>(resolve_function(hBcrypt, HASHA("BCryptDecrypt")));
+    f.pDestroyKey = reinterpret_cast<BCryptDestroyKey_t>(resolve_function(hBcrypt, HASHA("BCryptDestroyKey")));
+    f.pClose    = reinterpret_cast<BCryptCloseAlgorithmProvider_t>(resolve_function(hBcrypt, HASHA("BCryptCloseAlgorithmProvider")));
     f.valid = f.pOpen && f.pSetProp && f.pGenKey && f.pDecrypt && f.pDestroyKey && f.pClose;
     return f;
 }

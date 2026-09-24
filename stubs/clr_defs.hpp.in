@@ -1,0 +1,184 @@
+// Calypso - CLR hosting definitions for MinGW cross-compilation
+// Replaces metahost.h and mscoree.h which are unavailable in MinGW
+#pragma once
+
+#include <oaidl.h>
+#include <oleauto.h>
+
+// ==================== GUIDs ====================
+static const GUID CLSID_CLRMetaHost =
+    {0x9280188D, 0x0E8E, 0x4867, {0xB3, 0x0C, 0x7F, 0xA8, 0x38, 0x84, 0xE8, 0xDE}};
+static const GUID IID_ICLRMetaHost =
+    {0xD332DB9E, 0xB9B3, 0x4125, {0x82, 0x07, 0xA1, 0x48, 0x84, 0xF5, 0x32, 0x16}};
+static const GUID IID_ICLRRuntimeInfo =
+    {0xBD39D1D2, 0xBA2F, 0x486A, {0x89, 0xB0, 0xB4, 0xB0, 0xCB, 0x46, 0x68, 0x91}};
+static const GUID CLSID_CorRuntimeHost =
+    {0xCB2F6723, 0xAB3A, 0x11D2, {0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E}};
+static const GUID IID_ICorRuntimeHost =
+    {0xCB2F6722, 0xAB3A, 0x11D2, {0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E}};
+static const GUID IID_AppDomain =
+    {0x05F696DC, 0x2B29, 0x3663, {0xAD, 0x8B, 0xC4, 0x38, 0x9C, 0xF2, 0xA7, 0x13}};
+
+// ==================== CLRCreateInstance ====================
+typedef HRESULT (STDAPICALLTYPE *CLRCreateInstance_fn)(REFCLSID, REFIID, LPVOID*);
+
+// ==================== ICLRMetaHost ====================
+class ICLRMetaHost : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetRuntime(LPCWSTR pwzVersion, REFIID riid, LPVOID* ppRuntime) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetVersionFromFile(LPCWSTR pwzFilePath, LPWSTR pwzBuffer, DWORD* pcchBuffer) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumerateInstalledRuntimes(IEnumUnknown** ppEnumerator) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumerateLoadedRuntimes(HANDLE hndProcess, IEnumUnknown** ppEnumerator) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RequestRuntimeLoadedNotification(void* pCallbackFunction) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryLegacyV2RuntimeBinding(REFIID riid, LPVOID* ppUnk) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ExitProcess(INT32 iExitCode) = 0;
+};
+
+// ==================== ICLRRuntimeInfo ====================
+class ICLRRuntimeInfo : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetVersionString(LPWSTR pwzBuffer, DWORD* pcchBuffer) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetRuntimeDirectory(LPWSTR pwzBuffer, DWORD* pcchBuffer) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsLoaded(HANDLE hndProcess, BOOL* pbLoaded) = 0;
+    virtual HRESULT STDMETHODCALLTYPE LoadErrorString(UINT iResourceID, LPWSTR pwzBuffer, DWORD* pcchBuffer, LONG iLocaleID) = 0;
+    virtual HRESULT STDMETHODCALLTYPE LoadLibrary(LPCWSTR pwzDllName, HMODULE* phndModule) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetProcAddress(LPCSTR pszProcName, LPVOID* ppProc) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetInterface(REFCLSID rclsid, REFIID riid, LPVOID* ppUnk) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsLoadable(BOOL* pbLoadable) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDefaultStartupFlags(DWORD dwStartupFlags, LPCWSTR pwzHostConfigFile) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDefaultStartupFlags(DWORD* pdwStartupFlags, LPWSTR pwzHostConfigFile, DWORD* pcchHostConfigFile) = 0;
+    virtual HRESULT STDMETHODCALLTYPE BindAsLegacyV2Runtime() = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsStarted(BOOL* pbStarted, DWORD* pdwStartupFlags) = 0;
+};
+
+// ==================== ICorRuntimeHost ====================
+class ICorRuntimeHost : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE CreateLogicalThreadState() = 0;
+    virtual HRESULT STDMETHODCALLTYPE DeleteLogicalThreadState() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchInLogicalThreadState(DWORD* pFiberCookie) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchOutLogicalThreadState(DWORD** pFiberCookie) = 0;
+    virtual HRESULT STDMETHODCALLTYPE LocksHeldByLogicalThread(DWORD* pCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MapFile(HANDLE hFile, HMODULE* hMapAddress) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetConfiguration(void** pConfiguration) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Start() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Stop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateDomain(LPCWSTR pwzFriendlyName, IUnknown* pIdentityArray, IUnknown** pAppDomain) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDefaultDomain(IUnknown** pAppDomain) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumDomains(void** hEnum) = 0;
+    virtual HRESULT STDMETHODCALLTYPE NextDomain(void* hEnum, IUnknown** pAppDomain) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CloseEnum(void* hEnum) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateDomainEx(LPCWSTR pwzFriendlyName, IUnknown* pSetup, IUnknown* pEvidence, IUnknown** pAppDomain) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateDomainSetup(IUnknown** pAppDomainSetup) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateEvidence(IUnknown** pEvidence) = 0;
+    virtual HRESULT STDMETHODCALLTYPE UnloadDomain(IUnknown* pAppDomain) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CurrentDomain(IUnknown** pAppDomain) = 0;
+};
+
+// ==================== mscorlib COM interfaces ====================
+// Vtable padding macro — these entries exist solely to maintain correct vtable layout
+#define CLR_VTBL_PAD(n) virtual HRESULT STDMETHODCALLTYPE _vtpad_##n() = 0
+
+class _Assembly;
+class _MethodInfo;
+
+// _AppDomain : IDispatch + 39 methods, Load_3 at vtable index 45
+// IUnknown(3) + IDispatch(4) + 38 padding + Load_3
+class _AppDomain : public IDispatch {
+public:
+    CLR_VTBL_PAD(0);   // 7:  get_ToString
+    CLR_VTBL_PAD(1);   // 8:  Equals
+    CLR_VTBL_PAD(2);   // 9:  GetHashCode
+    CLR_VTBL_PAD(3);   // 10: GetType
+    CLR_VTBL_PAD(4);   // 11: InitializeLifetimeService
+    CLR_VTBL_PAD(5);   // 12: GetLifetimeService
+    CLR_VTBL_PAD(6);   // 13: get_Evidence
+    CLR_VTBL_PAD(7);   // 14: add_DomainUnload
+    CLR_VTBL_PAD(8);   // 15: remove_DomainUnload
+    CLR_VTBL_PAD(9);   // 16: add_AssemblyLoad
+    CLR_VTBL_PAD(10);  // 17: remove_AssemblyLoad
+    CLR_VTBL_PAD(11);  // 18: add_ProcessExit
+    CLR_VTBL_PAD(12);  // 19: remove_ProcessExit
+    CLR_VTBL_PAD(13);  // 20: add_TypeResolve
+    CLR_VTBL_PAD(14);  // 21: remove_TypeResolve
+    CLR_VTBL_PAD(15);  // 22: add_ResourceResolve
+    CLR_VTBL_PAD(16);  // 23: remove_ResourceResolve
+    CLR_VTBL_PAD(17);  // 24: add_AssemblyResolve
+    CLR_VTBL_PAD(18);  // 25: remove_AssemblyResolve
+    CLR_VTBL_PAD(19);  // 26: add_UnhandledException
+    CLR_VTBL_PAD(20);  // 27: remove_UnhandledException
+    CLR_VTBL_PAD(21);  // 28: DefineDynamicAssembly
+    CLR_VTBL_PAD(22);  // 29: DefineDynamicAssembly_2
+    CLR_VTBL_PAD(23);  // 30: DefineDynamicAssembly_3
+    CLR_VTBL_PAD(24);  // 31: DefineDynamicAssembly_4
+    CLR_VTBL_PAD(25);  // 32: DefineDynamicAssembly_5
+    CLR_VTBL_PAD(26);  // 33: DefineDynamicAssembly_6
+    CLR_VTBL_PAD(27);  // 34: DefineDynamicAssembly_7
+    CLR_VTBL_PAD(28);  // 35: DefineDynamicAssembly_8
+    CLR_VTBL_PAD(29);  // 36: DefineDynamicAssembly_9
+    CLR_VTBL_PAD(30);  // 37: CreateInstance
+    CLR_VTBL_PAD(31);  // 38: CreateInstanceFrom
+    CLR_VTBL_PAD(32);  // 39: CreateInstance_2
+    CLR_VTBL_PAD(33);  // 40: CreateInstanceFrom_2
+    CLR_VTBL_PAD(34);  // 41: CreateInstance_3
+    CLR_VTBL_PAD(35);  // 42: CreateInstanceFrom_3
+    CLR_VTBL_PAD(36);  // 43: Load
+    CLR_VTBL_PAD(37);  // 44: Load_2
+    virtual HRESULT STDMETHODCALLTYPE Load_3(SAFEARRAY* rawAssembly, _Assembly** pRetVal) = 0; // 45
+};
+
+// _Assembly : IDispatch + 10 methods, get_EntryPoint at vtable index 16
+// IUnknown(3) + IDispatch(4) + 9 padding + get_EntryPoint
+class _Assembly : public IDispatch {
+public:
+    CLR_VTBL_PAD(40);  // 7:  get_ToString
+    CLR_VTBL_PAD(41);  // 8:  Equals
+    CLR_VTBL_PAD(42);  // 9:  GetHashCode
+    CLR_VTBL_PAD(43);  // 10: GetType
+    CLR_VTBL_PAD(44);  // 11: get_CodeBase
+    CLR_VTBL_PAD(45);  // 12: get_EscapedCodeBase
+    CLR_VTBL_PAD(46);  // 13: GetName
+    CLR_VTBL_PAD(47);  // 14: GetName_2
+    CLR_VTBL_PAD(48);  // 15: get_FullName
+    virtual HRESULT STDMETHODCALLTYPE get_EntryPoint(_MethodInfo** pRetVal) = 0; // 16
+};
+
+// _MethodInfo : IDispatch + 32 methods, Invoke_3 at vtable index 38
+// IUnknown(3) + IDispatch(4) + 31 padding + Invoke_3
+class _MethodInfo : public IDispatch {
+public:
+    CLR_VTBL_PAD(50);  // 7:  get_ToString
+    CLR_VTBL_PAD(51);  // 8:  Equals
+    CLR_VTBL_PAD(52);  // 9:  GetHashCode
+    CLR_VTBL_PAD(53);  // 10: GetType
+    CLR_VTBL_PAD(54);  // 11: get_MemberType
+    CLR_VTBL_PAD(55);  // 12: get_Name
+    CLR_VTBL_PAD(56);  // 13: get_DeclaringType
+    CLR_VTBL_PAD(57);  // 14: get_ReflectedType
+    CLR_VTBL_PAD(58);  // 15: GetCustomAttributes
+    CLR_VTBL_PAD(59);  // 16: GetCustomAttributes_2
+    CLR_VTBL_PAD(60);  // 17: IsDefined
+    CLR_VTBL_PAD(61);  // 18: GetParameters
+    CLR_VTBL_PAD(62);  // 19: GetMethodImplementationFlags
+    CLR_VTBL_PAD(63);  // 20: get_MethodHandle
+    CLR_VTBL_PAD(64);  // 21: get_Attributes
+    CLR_VTBL_PAD(65);  // 22: get_CallingConvention
+    CLR_VTBL_PAD(66);  // 23: Invoke
+    CLR_VTBL_PAD(67);  // 24: get_IsPublic
+    CLR_VTBL_PAD(68);  // 25: get_IsPrivate
+    CLR_VTBL_PAD(69);  // 26: get_IsFamily
+    CLR_VTBL_PAD(70);  // 27: get_IsAssembly
+    CLR_VTBL_PAD(71);  // 28: get_IsFamilyAndAssembly
+    CLR_VTBL_PAD(72);  // 29: get_IsFamilyOrAssembly
+    CLR_VTBL_PAD(73);  // 30: get_IsStatic
+    CLR_VTBL_PAD(74);  // 31: get_IsFinal
+    CLR_VTBL_PAD(75);  // 32: get_IsVirtual
+    CLR_VTBL_PAD(76);  // 33: get_IsHideBySig
+    CLR_VTBL_PAD(77);  // 34: get_IsAbstract
+    CLR_VTBL_PAD(78);  // 35: get_IsSpecialName
+    CLR_VTBL_PAD(79);  // 36: get_IsConstructor
+    CLR_VTBL_PAD(80);  // 37: Invoke_2
+    virtual HRESULT STDMETHODCALLTYPE Invoke_3(VARIANT obj, SAFEARRAY* parameters, VARIANT* pRetVal) = 0; // 38
+};
+
+#undef CLR_VTBL_PAD

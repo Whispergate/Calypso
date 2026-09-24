@@ -1,0 +1,200 @@
+// Calypso - Custom API Resolution
+// Eliminates GetProcAddress, GetModuleHandle, LoadLibrary, Sleep from IAT
+// Uses DJB2 hashing, PEB walking, PE export parsing, and LdrLoadDll/NtDelayExecution
+#pragma once
+
+#ifndef CONTAINING_RECORD
+#define CONTAINING_RECORD(address, type, field) \
+    ((type *)((char *)(address) - (ULONG_PTR)(&((type *)0)->field)))
+#endif
+
+// ==================== DJB2 Hash ====================
+static constexpr uint32_t api_djb2(const char* str) {
+    uint32_t h = 5381;
+    while (*str)
+        h = ((h << 5) + h) + static_cast<uint8_t>(*str++);
+    return h;
+}
+
+#define HASHA(s) ([]() constexpr -> uint32_t { return api_djb2(s); }())
+
+// ==================== GetModuleHandle Replacement ====================
+static HMODULE resolve_module(uint32_t name_hash) {
+#ifdef _WIN64
+    auto* peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+#else
+    auto* peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
+#endif
+
+    auto* head = &peb->Ldr->InMemoryOrderModuleList;
+    for (auto* curr = head->Flink; curr != head; curr = curr->Flink) {
+        auto* entry = CONTAINING_RECORD(curr, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+        if (!entry->FullDllName.Buffer || entry->FullDllName.Length == 0)
+            continue;
+
+        int len = entry->FullDllName.Length / sizeof(WCHAR);
+
+        int start = 0;
+        for (int i = 0; i < len; i++) {
+            if (entry->FullDllName.Buffer[i] == L'\\')
+                start = i + 1;
+        }
+
+        char name[MAX_PATH] = {};
+        int nlen = len - start;
+        if (nlen >= MAX_PATH) nlen = MAX_PATH - 1;
+        for (int i = 0; i < nlen; i++) {
+            wchar_t c = entry->FullDllName.Buffer[start + i];
+            name[i] = (c >= L'a' && c <= L'z')
+                ? static_cast<char>(c - 32)
+                : static_cast<char>(c);
+        }
+
+        if (api_djb2(name) == name_hash)
+            return reinterpret_cast<HMODULE>(entry->DllBase);
+    }
+    return nullptr;
+}
+
+static HMODULE resolve_module_w(const wchar_t* dll_name) {
+    char upper[MAX_PATH] = {};
+    for (int i = 0; dll_name[i] && i < MAX_PATH - 1; i++) {
+        wchar_t c = dll_name[i];
+        upper[i] = (c >= L'a' && c <= L'z')
+            ? static_cast<char>(c - 32)
+            : static_cast<char>(c);
+    }
+    return resolve_module(api_djb2(upper));
+}
+
+// ==================== GetProcAddress Replacement ====================
+static FARPROC resolve_function(HMODULE hModule, uint32_t func_hash) {
+    if (!hModule) return nullptr;
+
+    auto* base = reinterpret_cast<PBYTE>(hModule);
+    auto* dos  = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress) return nullptr;
+
+    auto* exp  = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(base + dir.VirtualAddress);
+    auto* names = reinterpret_cast<PDWORD>(base + exp->AddressOfNames);
+    auto* funcs = reinterpret_cast<PDWORD>(base + exp->AddressOfFunctions);
+    auto* ords  = reinterpret_cast<PWORD>(base + exp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        auto* fname = reinterpret_cast<const char*>(base + names[i]);
+        if (api_djb2(fname) != func_hash)
+            continue;
+
+        auto* addr = base + funcs[ords[i]];
+        auto uAddr = reinterpret_cast<ULONG_PTR>(addr);
+        auto uExpS = reinterpret_cast<ULONG_PTR>(exp);
+
+        if (uAddr >= uExpS && uAddr < uExpS + dir.Size) {
+            char fwd[MAX_PATH] = {};
+            auto* src = reinterpret_cast<const char*>(addr);
+            for (int j = 0; src[j] && j < MAX_PATH - 5; j++) fwd[j] = src[j];
+
+            int dot = -1;
+            for (int j = 0; fwd[j]; j++) {
+                if (fwd[j] == '.') { dot = j; fwd[j] = '\0'; break; }
+            }
+            if (dot < 0) return nullptr;
+
+            char mod[MAX_PATH] = {};
+            for (int j = 0; j < dot; j++)
+                mod[j] = (fwd[j] >= 'a' && fwd[j] <= 'z') ? fwd[j] - 32 : fwd[j];
+            mod[dot] = '.'; mod[dot+1] = 'D'; mod[dot+2] = 'L'; mod[dot+3] = 'L';
+
+            HMODULE hFwd = resolve_module(api_djb2(mod));
+            if (!hFwd) return nullptr;
+            return resolve_function(hFwd, api_djb2(fwd + dot + 1));
+        }
+
+        return reinterpret_cast<FARPROC>(addr);
+    }
+    return nullptr;
+}
+
+// ==================== LoadLibrary Replacement ====================
+using LdrLoadDll_fn = NTSTATUS(WINAPI*)(PWSTR, PULONG, PUNICODE_STRING, PVOID*);
+
+static HMODULE load_module(const wchar_t* dll_name) {
+    static LdrLoadDll_fn pLdr = nullptr;
+    if (!pLdr) {
+        auto hNtdll = resolve_module(HASHA("NTDLL.DLL"));
+        if (!hNtdll) return nullptr;
+        pLdr = reinterpret_cast<LdrLoadDll_fn>(
+            resolve_function(hNtdll, HASHA("LdrLoadDll")));
+        if (!pLdr) return nullptr;
+    }
+
+    UNICODE_STRING us = {};
+    us.Buffer = const_cast<PWSTR>(dll_name);
+    const wchar_t* p = dll_name;
+    while (*p) p++;
+    us.Length = static_cast<USHORT>((p - dll_name) * sizeof(WCHAR));
+    us.MaximumLength = us.Length + sizeof(WCHAR);
+
+    PVOID hMod = nullptr;
+    if (pLdr(nullptr, nullptr, &us, &hMod) != 0)
+        return nullptr;
+    return reinterpret_cast<HMODULE>(hMod);
+}
+
+static HMODULE load_module_a(const char* dll_name) {
+    wchar_t wide[MAX_PATH] = {};
+    for (int i = 0; dll_name[i] && i < MAX_PATH - 1; i++)
+        wide[i] = static_cast<wchar_t>(dll_name[i]);
+    return load_module(wide);
+}
+
+// Runtime name-based variants (for PE import resolution where names are dynamic)
+static FARPROC resolve_function_by_name(HMODULE hModule, const char* func_name) {
+    return resolve_function(hModule, api_djb2(func_name));
+}
+
+static FARPROC resolve_function_by_ordinal(HMODULE hModule, WORD ordinal) {
+    if (!hModule) return nullptr;
+
+    auto* base = reinterpret_cast<PBYTE>(hModule);
+    auto* dos  = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress) return nullptr;
+
+    auto* exp  = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(base + dir.VirtualAddress);
+    auto* funcs = reinterpret_cast<PDWORD>(base + exp->AddressOfFunctions);
+
+    DWORD index = ordinal - exp->Base;
+    if (index >= exp->NumberOfFunctions) return nullptr;
+
+    return reinterpret_cast<FARPROC>(base + funcs[index]);
+}
+
+// ==================== Sleep Replacement ====================
+using NtDelayExec_fn = NTSTATUS(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
+
+static void sleep_ms(DWORD ms) {
+    static NtDelayExec_fn pDE = nullptr;
+    if (!pDE) {
+        auto hNtdll = resolve_module(HASHA("NTDLL.DLL"));
+        if (!hNtdll) return;
+        pDE = reinterpret_cast<NtDelayExec_fn>(
+            resolve_function(hNtdll, HASHA("NtDelayExecution")));
+        if (!pDE) return;
+    }
+    LARGE_INTEGER interval;
+    interval.QuadPart = -static_cast<LONGLONG>(ms) * 10000LL;
+    pDE(FALSE, &interval);
+}

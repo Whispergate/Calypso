@@ -112,6 +112,7 @@ struct PackerConfig {
     bool anti_debug                = true;
     SandboxChecks sandbox;
     bool self_delete               = false;
+    bool iat_camouflage            = false;
     std::vector<std::string> unhook_dlls;
 
     // Output

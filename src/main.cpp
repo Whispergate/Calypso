@@ -206,6 +206,8 @@ int main(int argc, char* argv[]) {
         std::cout << "  Obfuscation: Source-level + string encryption\n";
     if (cfg.llvm_obfuscate)
         std::cout << "  LLVM:        FLA + SUB + BCF\n";
+    if (cfg.iat_camouflage)
+        std::cout << "  IAT:         Camouflaged\n";
 
     return 0;
 }

@@ -173,6 +173,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
     if (cfg.sleep_seconds > 0) tags.push_back("SLEEP");
     if (cfg.anti_debug)        tags.push_back("ANTI_DEBUG");
     if (cfg.self_delete)       tags.push_back("SELF_DELETE");
+    if (cfg.iat_camouflage)    tags.push_back("IAT_CAMOUFLAGE");
 
     if (cfg.sandbox.any()) {
         tags.push_back("SANDBOX");
@@ -261,6 +262,8 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     std::string crypto_src  = read_file(stubs_dir + "/crypto_stub.hpp.in");
     std::string common_src  = read_file(stubs_dir + "/common.hpp.in");
     std::string evasion_src = read_file(stubs_dir + "/evasion.hpp.in");
+    std::string api_hash_src = read_file(stubs_dir + "/api_hashing.hpp.in");
+    std::string clr_defs_src = read_file(stubs_dir + "/clr_defs.hpp.in");
     std::string vm_ir_src    = read_file(stubs_dir + "/vm_ir.hpp.in");
     std::string vm_riscv_src = read_file(stubs_dir + "/vm_riscv.hpp.in");
 
@@ -277,21 +280,26 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     // Process obfuscate.hpp.in first (used by all others)
     obf_src = replace_all(obf_src, "{{OBFUSCATION_SEED}}", std::to_string(cfg.obf_seed));
 
-    // Inline includes in evasion (it includes syscalls and obfuscate)
+    // Inline includes in evasion (it includes syscalls, obfuscate, api_hashing)
     inline_include(evasion_src, "obfuscate.hpp.in", "// obfuscate already included");
+    inline_include(evasion_src, "api_hashing.hpp.in", "// api_hashing already included");
     inline_include(evasion_src, "syscalls.hpp.in", "// syscalls already included");
 
     // Inline includes in common
     inline_include(common_src, "obfuscate.hpp.in", "// obfuscate already included");
+    inline_include(common_src, "api_hashing.hpp.in", "// api_hashing already included");
 
     // Inline includes in crypto_stub
     inline_include(crypto_src, "obfuscate.hpp.in", "// obfuscate already included");
+    inline_include(crypto_src, "api_hashing.hpp.in", "// api_hashing already included");
 
     // Inline includes in syscalls
     inline_include(syscall_src, "obfuscate.hpp.in", "// obfuscate already included");
 
     // Inline into loader
     inline_include(loader_src, "obfuscate.hpp.in", obf_src);
+    inline_include(loader_src, "api_hashing.hpp.in", api_hash_src);
+    inline_include(loader_src, "clr_defs.hpp.in", clr_defs_src);
     inline_include(loader_src, "syscalls.hpp.in", syscall_src);
     inline_include(loader_src, "crypto_stub.hpp.in", crypto_src);
     inline_include(loader_src, "common.hpp.in", common_src);

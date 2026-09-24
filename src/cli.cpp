@@ -69,6 +69,7 @@ Evasion:
   --no-antidebug          Skip anti-debug checks
   --sandbox <checks>      domain,diskspace,memory,emulated (comma-separated)
   --self-delete           Loader deletes itself after execution
+  --iat-camouflage        Add benign API imports to disguise the IAT
   --unhook <dlls>         Unhook DLLs via fresh copy (comma-separated)
 
 Output:
@@ -269,6 +270,8 @@ PackerConfig parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--self-delete") {
             cfg.self_delete = true;
+        } else if (arg == "--iat-camouflage") {
+            cfg.iat_camouflage = true;
         } else if (arg == "--unhook") {
             cfg.unhook_dlls = split_csv(get_next(i));
         } else if (arg == "--output") {

