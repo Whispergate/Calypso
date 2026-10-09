@@ -134,11 +134,13 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
             cmd += " /Fe:\"" + output_path + "\"";
             cmd += " /link /SUBSYSTEM:";
             cmd += cfg.hide_window ? "WINDOWS" : "CONSOLE";
+            if (cfg.hide_window)
+                cmd += " /ENTRY:mainCRTStartup";
 
             if (cfg.crypto_backend == CryptoBackend::CNG)
                 cmd += " bcrypt.lib";
 
-            cmd += " advapi32.lib ole32.lib oleaut32.lib";
+            cmd += " advapi32.lib ole32.lib oleaut32.lib user32.lib";
             break;
         }
 
@@ -158,7 +160,7 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
             if (cfg.crypto_backend == CryptoBackend::CNG)
                 cmd += " -lbcrypt";
 
-            cmd += " -ladvapi32 -lole32 -loleaut32";
+            cmd += " -ladvapi32 -lole32 -loleaut32 -luser32";
             break;
         }
 
@@ -190,7 +192,7 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
             if (cfg.crypto_backend == CryptoBackend::CNG)
                 cmd += " -lbcrypt";
 
-            cmd += " -ladvapi32 -lole32 -loleaut32";
+            cmd += " -ladvapi32 -lole32 -loleaut32 -luser32";
             break;
         }
 

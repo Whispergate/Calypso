@@ -41,7 +41,7 @@ cl.exe /std:c++latest /EHsc /O2 /W3 /DWIN32 /D_WINDOWS /DNOMINMAX ^
     /Iinclude /Ithird_party/tiny-aes /Ithird_party/miniz /Ithird_party/lz4 ^
     src\main.cpp src\cli.cpp src\crypto.cpp src\encoding.cpp ^
     src\compression.cpp src\payload.cpp src\pe_parser.cpp ^
-    src\stub_generator.cpp src\compiler.cpp ^
+    src\stub_generator.cpp src\compiler.cpp src\obfuscation.cpp ^
     third_party\tiny-aes\aes.c third_party\miniz\miniz.c third_party\lz4\lz4.c ^
     /Fe:%OUTDIR%\Calypso.exe ^
     /link /SUBSYSTEM:CONSOLE bcrypt.lib advapi32.lib
@@ -57,7 +57,7 @@ g++.exe -std=c++23 -O2 -Wall -DWIN32 -D_WINDOWS -DNOMINMAX ^
     -Iinclude -Ithird_party/tiny-aes -Ithird_party/miniz -Ithird_party/lz4 ^
     src/main.cpp src/cli.cpp src/crypto.cpp src/encoding.cpp ^
     src/compression.cpp src/payload.cpp src/pe_parser.cpp ^
-    src/stub_generator.cpp src/compiler.cpp ^
+    src/stub_generator.cpp src/compiler.cpp src/obfuscation.cpp ^
     third_party/tiny-aes/aes.c third_party/miniz/miniz.c third_party/lz4/lz4.c ^
     -o %OUTDIR%/Calypso.exe ^
     -lbcrypt -ladvapi32
