@@ -14,7 +14,7 @@ enum class EncodingMethod { None, Base64, Hex, MAC, UUID };
 enum class CompressionMethod { None, Zlib, LZ4, RLE, LZNT };
 enum class InjectionMethod { Local, Remote };
 enum class ExecutionPrimitive { Direct, Thread, APC, Callback, Fiber, VM, RiscVM };
-enum class SyscallMethod { Indirect, HellsGate, HalosGate };
+enum class SyscallMethod { Indirect, HellsGate, HalosGate, Direct, Win32 };
 enum class OutputFormat { EXE, DLL };
 
 enum class AmsiBypass : uint32_t {
@@ -121,8 +121,9 @@ struct PackerConfig {
     std::vector<std::string> dll_exports;
     bool hide_window               = false;
     bool source_only               = false;
-    bool verbose                   = false;
+    bool debug                     = false;
     bool entropy_reduce            = false;
+    std::string redirect_output;
 };
 
 } // namespace calypso

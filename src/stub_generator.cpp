@@ -137,6 +137,12 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
             tags.push_back("SYSCALL_HELLSGATE");
             tags.push_back("SYSCALL_HALOSGATE");
             break;
+        case SyscallMethod::Direct:
+            tags.push_back("SYSCALL_DIRECT");
+            break;
+        case SyscallMethod::Win32:
+            tags.push_back("SYSCALL_WIN32");
+            break;
     }
 
     // Crypto backend
@@ -206,7 +212,7 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
     if (cfg.output_format == OutputFormat::DLL)  tags.push_back("DLL_ENTRY");
     if (cfg.output_format == OutputFormat::EXE)  tags.push_back("EXE_ENTRY");
 
-    if (cfg.verbose) tags.push_back("VERBOSE");
+    if (cfg.debug) tags.push_back("LOADER_DEBUG");
 
     if (!cfg.arguments.empty()) tags.push_back("HAS_ARGUMENTS");
     else                        tags.push_back("NO_ARGUMENTS");
@@ -226,6 +232,8 @@ static std::vector<std::string> get_enabled_tags(const PackerConfig& cfg) {
 
     if (cfg.entropy_reduce)        tags.push_back("ENTROPY_REDUCE");
     if (cfg.sleep_seconds > 0)     tags.push_back("SLEEP_IN_BETWEEN");
+    if (!cfg.redirect_output.empty()) tags.push_back("REDIRECT_OUTPUT");
+    else                              tags.push_back("NO_REDIRECT_OUTPUT");
 
     return tags;
 }
@@ -338,6 +346,11 @@ GeneratedStub generate_loader(const PackerConfig& cfg,
                              cfg.ppid_process);
     loader_src = replace_all(loader_src, "{{ARGUMENTS}}",
                              cfg.arguments);
+    {
+        std::string escaped_path = cfg.redirect_output;
+        escaped_path = replace_all(escaped_path, "\\", "\\\\");
+        loader_src = replace_all(loader_src, "{{REDIRECT_OUTPUT_PATH}}", escaped_path);
+    }
 
     // Encoded payload (if encoding is used)
     if (cfg.encoding != EncodingMethod::None) {

@@ -125,8 +125,10 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
     switch (compiler.type) {
         case CompilerType::MSVC: {
             cmd = compiler.path +
-                  " /std:c++latest /EHsc /O2 /GS- /MT /W0 /DNOMINMAX"
-                  " \"" + source_path + "\"";
+                  " /std:c++latest /EHsc /O2 /GS- /MT /W0 /DNOMINMAX";
+            if (cfg.debug)
+                cmd += " /Zi";
+            cmd += " \"" + source_path + "\"";
 
             if (cfg.output_format == OutputFormat::DLL)
                 cmd += " /LD";
@@ -136,6 +138,8 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
             cmd += cfg.hide_window ? "WINDOWS" : "CONSOLE";
             if (cfg.hide_window)
                 cmd += " /ENTRY:mainCRTStartup";
+            if (cfg.debug)
+                cmd += " /DEBUG";
 
             if (cfg.crypto_backend == CryptoBackend::CNG)
                 cmd += " bcrypt.lib";
@@ -146,8 +150,12 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
 
         case CompilerType::MinGW:
         case CompilerType::MinGWCross: {
-            cmd = compiler.path + " -std=c++23 -O2 -s -w -static -DNOMINMAX"
-                  " \"" + source_path + "\"";
+            cmd = compiler.path + " -std=c++23 -O2 -w -static -DNOMINMAX";
+            if (!cfg.debug)
+                cmd += " -s";
+            else
+                cmd += " -g";
+            cmd += " \"" + source_path + "\"";
 
             if (cfg.output_format == OutputFormat::DLL)
                 cmd += " -shared";

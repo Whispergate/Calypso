@@ -164,9 +164,16 @@ int main(int argc, char* argv[]) {
     std::cout << "  Cipher:      " << cipher_str(cfg.cipher) << "\n";
     std::cout << "  Backend:     " << (cfg.crypto_backend == calypso::CryptoBackend::CNG
                                         ? "CNG" : "tiny-AES") << "\n";
-    std::cout << "  Syscall:     " << (cfg.syscall_method == calypso::SyscallMethod::Indirect
-                                        ? "Indirect" : cfg.syscall_method == calypso::SyscallMethod::HellsGate
-                                        ? "Hell's Gate" : "Halo's Gate") << "\n";
+    std::cout << "  Syscall:     " << [&]() -> const char* {
+        switch (cfg.syscall_method) {
+            case calypso::SyscallMethod::Indirect:  return "Indirect";
+            case calypso::SyscallMethod::HellsGate: return "Hell's Gate";
+            case calypso::SyscallMethod::HalosGate: return "Halo's Gate";
+            case calypso::SyscallMethod::Direct:    return "Direct";
+            case calypso::SyscallMethod::Win32:     return "Win32 API";
+            default: return "Unknown";
+        }
+    }() << "\n";
     std::cout << "  Injection:   " << (cfg.injection == calypso::InjectionMethod::Local
                                         ? "Local" : "Remote") << "\n";
     std::cout << "  Format:      " << (cfg.output_format == calypso::OutputFormat::DLL
@@ -208,6 +215,10 @@ int main(int argc, char* argv[]) {
         std::cout << "  LLVM:        FLA + SUB + BCF\n";
     if (cfg.iat_camouflage)
         std::cout << "  IAT:         Camouflaged\n";
+    if (cfg.debug)
+        std::cout << "  Build:       Debug (symbols + loader output)\n";
+    if (!cfg.redirect_output.empty())
+        std::cout << "  Output:      -> " << cfg.redirect_output << "\n";
 
     return 0;
 }

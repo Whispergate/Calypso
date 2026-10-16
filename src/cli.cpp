@@ -56,7 +56,7 @@ Injection:
   --drip                  Drip-load shellcode in small chunks
 
 Syscalls:
-  --syscall <method>      indirect (default) | hellsgate | halosgate
+  --syscall <method>      indirect (default) | hellsgate | halosgate | direct | win32
 
 Evasion:
   --sleep <seconds>       Sleep before decryption (default: 0)
@@ -78,8 +78,9 @@ Output:
   --dll-export <names>    Comma-separated DLL export function names
   --hide                  Build as GUI app (no console window)
   --source-only           Emit generated source, don't compile
-  --verbose               Loader prints debug output
+  --debug                 Build loader with debug output and symbols
   --entropy-reduce        Reduce payload entropy to evade static analysis
+  --redirect-output <p>   Redirect .NET assembly console output to file path
 )" << std::endl;
 }
 
@@ -244,6 +245,8 @@ PackerConfig parse_args(int argc, char* argv[]) {
             if (s == "indirect")        cfg.syscall_method = SyscallMethod::Indirect;
             else if (s == "hellsgate")  cfg.syscall_method = SyscallMethod::HellsGate;
             else if (s == "halosgate")  cfg.syscall_method = SyscallMethod::HalosGate;
+            else if (s == "direct")     cfg.syscall_method = SyscallMethod::Direct;
+            else if (s == "win32")      cfg.syscall_method = SyscallMethod::Win32;
             else { std::cerr << "[!] Unknown syscall: " << s << "\n"; std::exit(1); }
         } else if (arg == "--sleep") {
             cfg.sleep_seconds = static_cast<uint32_t>(std::stoul(get_next(i)));
@@ -284,10 +287,12 @@ PackerConfig parse_args(int argc, char* argv[]) {
             cfg.hide_window = true;
         } else if (arg == "--source-only") {
             cfg.source_only = true;
-        } else if (arg == "--verbose") {
-            cfg.verbose = true;
+        } else if (arg == "--debug") {
+            cfg.debug = true;
         } else if (arg == "--entropy-reduce") {
             cfg.entropy_reduce = true;
+        } else if (arg == "--redirect-output") {
+            cfg.redirect_output = get_next(i);
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
