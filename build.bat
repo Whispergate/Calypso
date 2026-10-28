@@ -43,6 +43,7 @@ cl.exe /std:c++latest /EHsc /O2 /W3 /DWIN32 /D_WINDOWS /DNOMINMAX ^
     src\compression.cpp src\payload.cpp src\pe_parser.cpp ^
     src\stub_generator.cpp src\compiler.cpp src\obfuscation.cpp ^
     third_party\tiny-aes\aes.c third_party\miniz\miniz.c third_party\lz4\lz4.c ^
+    /Fo:%OUTDIR%\ /Fd:%OUTDIR%\ ^
     /Fe:%OUTDIR%\Calypso.exe ^
     /link /SUBSYSTEM:CONSOLE bcrypt.lib advapi32.lib
 if %ERRORLEVEL% neq 0 (
@@ -69,4 +70,6 @@ echo [+] Build successful: %OUTDIR%\Calypso.exe
 goto :end
 
 :end
+REM Clean up any stray obj/pdb files that ended up in the project root
+del /q *.obj *.pdb *.ilk *.idb 2>nul
 endlocal

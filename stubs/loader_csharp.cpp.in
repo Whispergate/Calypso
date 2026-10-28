@@ -167,11 +167,16 @@ static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
     SafeArrayUnaccessData(pSafeArray);
 
     // Load assembly
-    _Assembly* pAssembly = nullptr;
-    hr = pAppDomain->Load_3(pSafeArray, &pAssembly);
+    // NOTE: _Assembly is a DISPINTERFACE (TKIND_DISPATCH) in mscorlib.tlb, so the
+    // pointer returned by Load_3 is an IDispatch* - it has no stable vtable and must
+    // not be called through the raw _Assembly slots. Only _MethodInfo (TKIND_INTERFACE)
+    // is invoked via vtable below.
+    IDispatch* pAssemblyDisp = nullptr;
+    hr = pAppDomain->Load_3(pSafeArray,
+        reinterpret_cast<_Assembly**>(&pAssemblyDisp));
     SafeArrayDestroy(pSafeArray);
 
-    if (FAILED(hr) || !pAssembly) { DBG("Load_3 FAILED: 0x%08lx", hr);
+    if (FAILED(hr) || !pAssemblyDisp) { DBG("Load_3 FAILED: 0x%08lx", hr);
         pAppDomain->Release();
         pRuntimeHost->Stop();
         pRuntimeHost->Release();
@@ -182,17 +187,44 @@ static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
 
     DBG("assembly loaded");
 
-    // Get entry point
+    // Get entry point via IDispatch (dispid-based, layout-independent)
     _MethodInfo* pEntryPoint = nullptr;
-    hr = pAssembly->get_EntryPoint(&pEntryPoint);
-    if (FAILED(hr) || !pEntryPoint) { DBG("get_EntryPoint FAILED: 0x%08lx", hr);
-        pAssembly->Release();
-        pAppDomain->Release();
-        pRuntimeHost->Stop();
-        pRuntimeHost->Release();
-        pRuntimeInfo->Release();
-        pMetaHost->Release();
-        return;
+    {
+        OLECHAR epName[] = L"EntryPoint";
+        OLECHAR* epNames = epName;
+        DISPID epDispid;
+        hr = pAssemblyDisp->GetIDsOfNames(IID_NULL, &epNames, 1,
+                                          LOCALE_SYSTEM_DEFAULT, &epDispid);
+        if (FAILED(hr)) { DBG("GetIDsOfNames(EntryPoint) FAILED: 0x%08lx", hr);
+            pAssemblyDisp->Release();
+            pAppDomain->Release();
+            pRuntimeHost->Stop();
+            pRuntimeHost->Release();
+            pRuntimeInfo->Release();
+            pMetaHost->Release();
+            return;
+        }
+
+        DISPPARAMS noParams = {};
+        EXCEPINFO excep = {};
+        UINT argErr = 0;
+        VARIANT varEntry;
+        VariantInit(&varEntry);
+        hr = pAssemblyDisp->Invoke(epDispid, IID_NULL, LOCALE_SYSTEM_DEFAULT,
+            DISPATCH_METHOD | DISPATCH_PROPERTYGET, &noParams, &varEntry, &excep, &argErr);
+        if (excep.bstrDescription) { DBG("EntryPoint excep: %ls", excep.bstrDescription); SysFreeString(excep.bstrDescription); }
+        if (FAILED(hr) || !varEntry.punkVal) { DBG("EntryPoint getter FAILED: 0x%08lx", hr);
+            VariantClear(&varEntry);
+            pAssemblyDisp->Release();
+            pAppDomain->Release();
+            pRuntimeHost->Stop();
+            pRuntimeHost->Release();
+            pRuntimeInfo->Release();
+            pMetaHost->Release();
+            return;
+        }
+        // EntryPoint returns the raw _MethodInfo interface pointer (VT_UNKNOWN)
+        pEntryPoint = reinterpret_cast<_MethodInfo*>(varEntry.punkVal);
     }
 
     // Prepare arguments
@@ -264,10 +296,21 @@ static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
     DBG("entry point found, invoking...");
 
     // Invoke entry point
+    // For a parameterless Main the args safearray must contain 0 elements -
+    // Invoke_3 rejects a 1-element array with DISP_E_BADPARAMCOUNT, so retry empty.
     VARIANT retVal;
     VariantInit(&retVal);
     hr = pEntryPoint->Invoke_3(VARIANT{}, pArgs, &retVal);
     DBG("Invoke_3 returned: 0x%08lx (retVal.vt=0x%04x)", hr, retVal.vt);
+    if (hr == DISP_E_BADPARAMCOUNT && pArgs) {
+        DBG("parameterless entry point detected, retrying with 0 args");
+        SafeArrayDestroy(pArgs);
+        SAFEARRAYBOUND empty_bounds = { 0, 0 };
+        pArgs = SafeArrayCreate(VT_VARIANT, 1, &empty_bounds);
+        VariantClear(&retVal);
+        hr = pEntryPoint->Invoke_3(VARIANT{}, pArgs, &retVal);
+        DBG("Invoke_3 retry returned: 0x%08lx (retVal.vt=0x%04x)", hr, retVal.vt);
+    }
 
     // If entry point is async (returns Task), wait for completion
     if (SUCCEEDED(hr) && (retVal.vt == VT_UNKNOWN || retVal.vt == VT_DISPATCH)) {
@@ -305,7 +348,7 @@ static void run_dotnet_assembly(uint8_t* assembly_data, size_t assembly_size) {
     VariantClear(&retVal);
     SafeArrayDestroy(pArgs);
     pEntryPoint->Release();
-    pAssembly->Release();
+    pAssemblyDisp->Release();
     pAppDomain->Release();
     pRuntimeHost->Stop();
     pRuntimeHost->Release();

@@ -1,9 +1,8 @@
 // Calypso loader - compile-time string encryption + call obfuscation
 // Inspired by Obfusk8 (@x86byte) and ADVobfuscator (Sebastien Andrivet)
 #pragma once
-#include <cstdint>
-#include <cstring>
-#include <utility>
+#include <stdint.h>
+#include <string.h>
 
 // Compile-time string encryption using __COUNTER__ + constexpr (ADVobfuscator pattern)
 namespace calypso_obf {

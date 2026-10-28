@@ -150,7 +150,7 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
 
         case CompilerType::MinGW:
         case CompilerType::MinGWCross: {
-            cmd = compiler.path + " -std=c++23 -O2 -w -static -DNOMINMAX";
+            cmd = compiler.path + " -std=c++23 -O2 -w -static -DNOMINMAX -nostdlib++";
             if (!cfg.debug)
                 cmd += " -s";
             else
@@ -168,7 +168,7 @@ bool compile_loader(const PackerConfig& cfg, const std::string& source_path,
             if (cfg.crypto_backend == CryptoBackend::CNG)
                 cmd += " -lbcrypt";
 
-            cmd += " -ladvapi32 -lole32 -loleaut32 -luser32";
+            cmd += " -ladvapi32 -lole32 -loleaut32 -luuid -luser32";
             break;
         }
 

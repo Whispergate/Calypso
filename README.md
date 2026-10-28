@@ -31,15 +31,57 @@ Written by **@Whispergate** and **@Lavender-exe**.
 
 ---
 
+## Requirements
+
+### Building the Packer
+
+The packer itself is a native C++23 application. You need a host compiler with C++23 support:
+
+| Platform | Compiler | Minimum Version |
+|----------|----------|-----------------|
+| **Windows** | MSVC (Visual Studio 2022) | v17.0+ (`/std:c++latest`) |
+| **Windows** | MinGW-w64 | GCC 13+ |
+| **Linux / WSL** | GCC | 13+ |
+| **Linux / WSL** | Clang | 16+ |
+| **macOS** | Apple Clang / Homebrew GCC | Clang 16+ / GCC 13+ |
+
+### Cross-Compiling Loaders (Linux)
+
+When running on Linux, Calypso uses MinGW-w64 to cross-compile Windows loader binaries. Install the **full** g++ cross-compiler (not just `gcc-mingw-w64-bootstrap`, which lacks runtime libraries):
+
+```bash
+# Debian / Ubuntu / Kali
+sudo apt install g++-mingw-w64-x86-64
+
+# Arch
+sudo pacman -S mingw-w64-gcc
+
+# Fedora
+sudo dnf install mingw64-gcc-c++
+```
+
+The `g++-mingw-w64-x86-64` package provides `x86_64-w64-mingw32-g++` along with `libgcc`, `libgcc_eh`, and the Windows CRT needed for static linking. The bootstrap-only package (`gcc-mingw-w64-bootstrap`) will compile but fail at link time.
+
+### Optional Dependencies
+
+| Dependency | Required For | Install |
+|------------|-------------|---------|
+| LLVM 17+ & Clang | `--llvm-obfuscate` | `apt install llvm-21 clang-21` |
+| [eshard/obfuscator-llvm](https://github.com/eshard/obfuscator-llvm) | `--llvm-obfuscate` | See [Installing Obfuscator-LLVM](#installing-obfuscator-llvm) |
+| Donut | `--peinject` | Built automatically by `make` from `tools/donut_ollvm/` |
+
+---
+
 ## Building
 
 ### Linux / WSL
 
 ```bash
+sudo apt install g++ g++-mingw-w64-x86-64 make
 make
 ```
 
-Requires `g++` with C++23 support (GCC 13+ or Clang 16+). The built binary lands in `build/calypso`.
+The packer binary lands in `build/calypso`. MinGW is used at pack-time to cross-compile loader stubs.
 
 ### Windows (MinGW)
 

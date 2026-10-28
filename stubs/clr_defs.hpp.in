@@ -177,8 +177,10 @@ public:
     CLR_VTBL_PAD(77);  // 34: get_IsAbstract
     CLR_VTBL_PAD(78);  // 35: get_IsSpecialName
     CLR_VTBL_PAD(79);  // 36: get_IsConstructor
-    CLR_VTBL_PAD(80);  // 37: Invoke_2
-    virtual HRESULT STDMETHODCALLTYPE Invoke_3(VARIANT obj, SAFEARRAY* parameters, VARIANT* pRetVal) = 0; // 38
+    // NOTE: no Invoke_2 pad here - mscorlib.tlb only has Invoke_2 at slot 23 (the "Invoke"
+    // pad above); an extra pad shifted Invoke_3 to slot 38 where get_returnType actually
+    // lives, so the entry point never executed.
+    virtual HRESULT STDMETHODCALLTYPE Invoke_3(VARIANT obj, SAFEARRAY* parameters, VARIANT* pRetVal) = 0; // 37
 };
 
 #undef CLR_VTBL_PAD
